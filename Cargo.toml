@@ -1,0 +1,20 @@
+[package]
+name = "fs-worker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2.183"
+libzfs = "0.6.16"
+libzfs-sys = "0.5.11"
+nvpair = "0.5.0"
+nvpair-sys = "0.4.0"
+prost = "0.14.3"
+tokio = { version = "1.50.0", features = ["full"] }
+tonic = "0.14.5"
+tonic-prost = "0.14.5"
+zfs-core = "0.5.0"
+
+[build-dependencies]
+tonic-build = "0.14.5"
+tonic-prost-build = "0.14.5"
