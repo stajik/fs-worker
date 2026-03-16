@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# vm-run.sh — Start the worker gRPC service inside the Multipass VM
+# vm-run.sh — Start the fs-worker on the target
+#
+# Local mode  (default):  runs inside the Multipass VM
+# Remote mode (--remote): runs on the bare-metal SSH host defined in .env
 #
 # Usage:
-#   ./scripts/vm-run.sh [--release] [--rebuild] [--detach]
+#   ./scripts/vm-run.sh [--remote] [--release] [--rebuild] [--detach]
 #
+#   --remote    Target the SSH bare-metal host defined in .env
 #   --release   Run the release binary (default: debug)
 #   --rebuild   Run vm-build.sh before starting
 #   --detach    Run as a background systemd service instead of foreground
@@ -13,23 +17,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VM_NAME="zfs-dev"
-VM_MOUNT_PATH="/home/ubuntu/worker"
-GRPC_PORT=50051
-
-# ---------------------------------------------------------------------------
-# Colours
-# ---------------------------------------------------------------------------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-log()  { echo -e "${CYAN}[vm-run]${NC} $*"; }
-ok()   { echo -e "${GREEN}[vm-run]${NC} $*"; }
-warn() { echo -e "${YELLOW}[vm-run]${NC} $*"; }
-die()  { echo -e "${RED}[vm-run] ERROR:${NC} $*" >&2; exit 1; }
+LOG_PREFIX="[vm-run]"
+source "${SCRIPT_DIR}/lib.sh"
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -37,6 +26,10 @@ die()  { echo -e "${RED}[vm-run] ERROR:${NC} $*" >&2; exit 1; }
 RELEASE=0
 REBUILD=0
 DETACH=0
+
+parse_mode_flag "$@"
+set -- "${FILTERED_ARGS[@]}"
+
 for arg in "$@"; do
     case "$arg" in
         --release) RELEASE=1 ;;
@@ -47,103 +40,98 @@ for arg in "$@"; do
 done
 
 # ---------------------------------------------------------------------------
-# Sanity checks
+# Validate mode and connectivity
 # ---------------------------------------------------------------------------
-command -v multipass &>/dev/null || die "multipass is not installed or not in PATH."
+validate_mode
+remote_check_reachable
 
-VM_STATE=$(multipass list --format csv 2>/dev/null | grep "^${VM_NAME}," | cut -d',' -f2 || true)
-[[ -z "$VM_STATE" ]]           && die "VM '${VM_NAME}' does not exist. Run ./scripts/vm-setup.sh first."
-[[ "$VM_STATE" != "Running" ]] && die "VM '${VM_NAME}' is not running. Start it with: multipass start ${VM_NAME}"
+WORK_DIR="$(remote_work_dir)"
+
+print_mode_banner
+echo ""
 
 # ---------------------------------------------------------------------------
 # Optionally rebuild first
 # ---------------------------------------------------------------------------
 if [[ $REBUILD -eq 1 ]]; then
     log "Rebuilding before starting ..."
-    REBUILD_FLAGS=""
-    [[ $RELEASE -eq 1 ]] && REBUILD_FLAGS="--release"
-    "$SCRIPT_DIR/vm-build.sh" $REBUILD_FLAGS
+    BUILD_FLAGS=""
+    [[ $RELEASE -eq 1 ]] && BUILD_FLAGS="--release"
+    [[ "${MODE}" == "remote" ]] && BUILD_FLAGS="--remote ${BUILD_FLAGS}"
+    "$SCRIPT_DIR/vm-build.sh" ${BUILD_FLAGS}
 fi
 
 # ---------------------------------------------------------------------------
 # Determine binary path
 # ---------------------------------------------------------------------------
 if [[ $RELEASE -eq 1 ]]; then
-    BINARY="${VM_MOUNT_PATH}/target/release/worker"
+    BINARY="${WORK_DIR}/target/release/fs-worker"
     PROFILE="release"
 else
-    BINARY="${VM_MOUNT_PATH}/target/debug/worker"
+    BINARY="${WORK_DIR}/target/debug/fs-worker"
     PROFILE="debug"
 fi
 
-# Verify the binary exists in the VM
-multipass exec "$VM_NAME" -- bash -c "
+# Verify the binary exists on the target
+remote_exec "
     test -f '${BINARY}' || {
         echo 'Binary not found: ${BINARY}'
         echo 'Run ./scripts/vm-build.sh first, or pass --rebuild.'
         exit 1
     }
-" || die "Binary '${BINARY}' not found inside VM."
+" || die "Binary '${BINARY}' not found on target."
 
 # ---------------------------------------------------------------------------
-# Ensure ZFS test pool is imported
+# Ensure ZFS pool is imported
 # ---------------------------------------------------------------------------
-log "Ensuring ZFS test pool is available ..."
-multipass exec "$VM_NAME" -- sudo bash -c "
-    if ! zpool list testpool &>/dev/null; then
-        echo 'Importing testpool ...'
-        systemctl start zfs-loopback-pool.service || true
-        sleep 1
-        zpool list testpool 2>/dev/null && echo 'Pool imported.' || echo 'WARNING: testpool not available.'
-    else
-        echo 'testpool already imported.'
-    fi
-"
+log "Ensuring ZFS pool '${ZFS_POOL}' is available ..."
+ensure_pool_imported "${ZFS_POOL}"
 
 # ---------------------------------------------------------------------------
-# Detach mode — manage via systemd worker.service
+# Detach mode — manage via systemd fs-worker.service
 # ---------------------------------------------------------------------------
 if [[ $DETACH -eq 1 ]]; then
-    log "Starting worker as a background systemd service ..."
+    log "Starting fs-worker as a background systemd service ..."
 
-    multipass exec "$VM_NAME" -- sudo bash -c "
-        # Patch the service unit to point at the correct binary profile
-        sed -i 's|ExecStart=.*|ExecStart=${BINARY}|' /etc/systemd/system/worker.service
+    remote_exec_sudo "
+        sed -i 's|ExecStart=.*|ExecStart=${BINARY}|' /etc/systemd/system/fs-worker.service
         systemctl daemon-reload
-        systemctl restart worker.service
+        systemctl restart fs-worker.service
         sleep 2
-        systemctl status worker.service --no-pager
+        systemctl status fs-worker.service --no-pager
     "
 
-    VM_IP=$(multipass info "$VM_NAME" | awk '/IPv4/ {print $2}')
-    ok "Worker service started in background."
+    TARGET_IP="$(remote_ip)"
+    ok "fs-worker service started in background."
     ok "  Binary  : ${BINARY} (${PROFILE})"
-    ok "  gRPC    : ${VM_IP}:${GRPC_PORT}"
+    ok "  Host    : ${TARGET_IP}"
     ok ""
     ok "  Useful commands:"
     ok "    ./scripts/vm-logs.sh              # tail service logs"
-    ok "    ./scripts/vm-port-forward.sh      # forward to localhost:${GRPC_PORT}"
-    ok "    multipass exec ${VM_NAME} -- sudo systemctl stop worker.service"
+    ok "    ./scripts/vm-port-forward.sh      # forward Temporal port to localhost"
+    if [[ "${MODE}" == "remote" ]]; then
+        ok "    ssh -i ${REMOTE_PEM} ${REMOTE_USER}@${REMOTE_HOST} 'sudo systemctl stop fs-worker.service'"
+    else
+        ok "    multipass exec ${VM_NAME} -- sudo systemctl stop fs-worker.service"
+    fi
     exit 0
 fi
 
 # ---------------------------------------------------------------------------
 # Foreground mode — run directly, stream output to this terminal
 # ---------------------------------------------------------------------------
-VM_IP=$(multipass info "$VM_NAME" | awk '/IPv4/ {print $2}')
+TARGET_IP="$(remote_ip)"
 
-log "Starting worker in foreground (${PROFILE} build) ..."
-log "  gRPC endpoint inside VM : [::1]:${GRPC_PORT}"
-log "  VM IP                   : ${VM_IP}"
+log "Starting fs-worker in foreground (${PROFILE} build) ..."
+log "  Host        : ${TARGET_IP}"
 log "  Press Ctrl-C to stop."
 echo ""
 
-# Kill any existing foreground worker process first
-multipass exec "$VM_NAME" -- bash -c "
-    pkill -x worker 2>/dev/null && echo 'Stopped previous worker process.' || true
-" || true
+# Kill any existing foreground fs-worker process
+remote_exec "pkill -x fs-worker 2>/dev/null && echo 'Stopped previous fs-worker process.' || true" || true
 
-multipass exec "$VM_NAME" -- bash -c "
+remote_exec "
     export RUST_LOG=\${RUST_LOG:-info}
+    export ZFS_POOL='${ZFS_POOL}'
     exec '${BINARY}'
 "

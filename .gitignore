@@ -1,1 +1,7 @@
 /target
+
+# Local environment — contains SSH credentials, never commit
+.env
+
+# SSH tunnel PID written by vm-port-forward.sh
+scripts/.vm-tunnel.pid

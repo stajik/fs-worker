@@ -1,46 +1,42 @@
 #!/usr/bin/env bash
 # =============================================================================
-# vm-port-forward.sh — Forward the VM's gRPC port to localhost
+# vm-port-forward.sh — Forward the Temporal port to localhost
 #
-# Establishes an SSH tunnel from localhost:50051 → VM:50051 so you can point
-# gRPC clients at localhost:50051 from your Mac without knowing the VM's IP.
+# Local mode  (default):  tunnels through the Multipass VM
+# Remote mode (--remote): tunnels through the bare-metal SSH host in .env
 #
 # Usage:
-#   ./scripts/vm-port-forward.sh [--port <local-port>] [--background]
+#   ./scripts/vm-port-forward.sh [--remote] [--port <local-port>] [--background]
+#   ./scripts/vm-port-forward.sh [--remote] --stop
 #
-#   --port <n>    Local port to bind (default: 50051)
-#   --background  Run the tunnel in the background (writes PID to .vm-tunnel.pid)
-#   --stop        Kill a previously backgrounded tunnel
+#   --remote        Target the SSH bare-metal host defined in .env
+#   --port <n>      Local port to bind (default: 7233)
+#   --background    Run the tunnel in the background (PID saved to .vm-tunnel.pid)
+#   --stop          Kill a previously backgrounded tunnel
 # =============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VM_NAME="zfs-dev"
-REMOTE_PORT=50051
-LOCAL_PORT=50051
+LOG_PREFIX="[port-forward]"
+source "${SCRIPT_DIR}/lib.sh"
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+REMOTE_TEMPORAL_PORT=7233   # Temporal server port on the target
+LOCAL_PORT=7233
 PID_FILE="${SCRIPT_DIR}/.vm-tunnel.pid"
-SSH_KEY_DIR="${HOME}/.ssh"
-
-# ---------------------------------------------------------------------------
-# Colours
-# ---------------------------------------------------------------------------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-log()  { echo -e "${CYAN}[port-forward]${NC} $*"; }
-ok()   { echo -e "${GREEN}[port-forward]${NC} $*"; }
-warn() { echo -e "${YELLOW}[port-forward]${NC} $*"; }
-die()  { echo -e "${RED}[port-forward] ERROR:${NC} $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
 BACKGROUND=0
 STOP=0
+
+parse_mode_flag "$@"
+set -- "${FILTERED_ARGS[@]}"
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)
@@ -74,18 +70,15 @@ if [[ $STOP -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Sanity checks
+# Validate mode and connectivity
 # ---------------------------------------------------------------------------
-command -v multipass &>/dev/null || die "multipass is not installed or not in PATH."
-command -v ssh       &>/dev/null || die "ssh is not installed or not in PATH."
+validate_mode
+remote_check_reachable
 
-VM_STATE=$(multipass list --format csv 2>/dev/null | grep "^${VM_NAME}," | cut -d',' -f2 || true)
-[[ -z "$VM_STATE" ]]           && die "VM '${VM_NAME}' does not exist. Run ./scripts/vm-setup.sh first."
-[[ "$VM_STATE" != "Running" ]] && die "VM '${VM_NAME}' is not running. Start it with: multipass start ${VM_NAME}"
+command -v ssh &>/dev/null || die "ssh is not installed or not in PATH."
 
 # Check if local port is already in use
 if lsof -iTCP:"${LOCAL_PORT}" -sTCP:LISTEN &>/dev/null; then
-    # If we already have a tunnel for this port, mention it specifically
     if [[ -f "$PID_FILE" ]]; then
         TUNNEL_PID=$(cat "$PID_FILE")
         if kill -0 "$TUNNEL_PID" 2>/dev/null; then
@@ -94,78 +87,73 @@ if lsof -iTCP:"${LOCAL_PORT}" -sTCP:LISTEN &>/dev/null; then
             exit 0
         fi
     fi
-    die "Port ${LOCAL_PORT} is already in use by another process. Use --port <n> to choose a different local port."
+    die "Port ${LOCAL_PORT} is already in use. Use --port <n> to choose a different local port."
 fi
 
 # ---------------------------------------------------------------------------
-# Locate the Multipass SSH key for this VM
+# Resolve SSH connection parameters
 # ---------------------------------------------------------------------------
-# Multipass stores per-instance keys under its data directory.
-# Fall back to the global key if the per-instance one isn't found.
-MULTIPASS_DATA_DIRS=(
-    "${HOME}/Library/Application Support/multipassd/ssh-keys"  # macOS (user)
-    "/var/root/Library/Application Support/multipassd/ssh-keys" # macOS (root daemon)
-    "/var/snap/multipass/common/data/multipassd/ssh-keys"        # Linux snap
-    "/var/lib/multipass/ssh-keys"                                # Linux package
-)
+# In remote mode the key is always known from .env.
+# In local mode we locate the Multipass-managed key.
 
-SSH_KEY=""
-for dir in "${MULTIPASS_DATA_DIRS[@]}"; do
-    candidate="${dir}/id_rsa"
-    if [[ -f "$candidate" ]]; then
-        SSH_KEY="$candidate"
-        break
-    fi
-done
+TARGET_IP="$(remote_ip)"
+[[ -z "$TARGET_IP" ]] && die "Could not determine IP address of target."
 
-if [[ -z "$SSH_KEY" ]]; then
-    # Last resort: try the key embedded in the multipass info output
-    warn "Could not locate Multipass SSH key automatically."
-    warn "Falling back to: multipass exec (which uses its own SSH internally)."
-    USE_MULTIPASS_EXEC=1
+if [[ "${MODE}" == "remote" ]]; then
+    SSH_KEY="${REMOTE_PEM}"
+    SSH_USER="${REMOTE_USER}"
+    SSH_PORT="${REMOTE_PORT}"
 else
-    USE_MULTIPASS_EXEC=0
-    log "Using SSH key: ${SSH_KEY}"
+    # Locate the Multipass SSH key
+    MULTIPASS_DATA_DIRS=(
+        "${HOME}/Library/Application Support/multipassd/ssh-keys"
+        "/var/root/Library/Application Support/multipassd/ssh-keys"
+        "/var/snap/multipass/common/data/multipassd/ssh-keys"
+        "/var/lib/multipass/ssh-keys"
+    )
+    SSH_KEY=""
+    for dir in "${MULTIPASS_DATA_DIRS[@]}"; do
+        candidate="${dir}/id_rsa"
+        if [[ -f "$candidate" ]]; then
+            SSH_KEY="$candidate"
+            break
+        fi
+    done
+    SSH_USER="ubuntu"
+    SSH_PORT="22"
 fi
 
 # ---------------------------------------------------------------------------
-# Get the VM's IP address
+# Build SSH tunnel command
 # ---------------------------------------------------------------------------
-VM_IP=$(multipass info "$VM_NAME" 2>/dev/null | awk '/IPv4/ {print $2}' | head -1)
-[[ -z "$VM_IP" ]] && die "Could not determine IP address of VM '${VM_NAME}'."
-
-log "VM IP : ${VM_IP}"
-log "Tunnel: localhost:${LOCAL_PORT} → ${VM_IP}:${REMOTE_PORT}"
-
-# ---------------------------------------------------------------------------
-# Build the SSH tunnel command
-# ---------------------------------------------------------------------------
-# -N        : don't execute a remote command
-# -T        : disable pseudo-terminal allocation
-# -L        : local port forwarding
-# -o ...    : suppress host-key prompts / keep-alive
+# -N  : no remote command
+# -T  : no PTY
+# -L  : local port forward
 SSH_OPTS=(
-    -N
-    -T
-    -L "${LOCAL_PORT}:localhost:${REMOTE_PORT}"
+    -N -T
+    -L "${LOCAL_PORT}:localhost:${REMOTE_TEMPORAL_PORT}"
     -o StrictHostKeyChecking=no
     -o UserKnownHostsFile=/dev/null
     -o LogLevel=ERROR
     -o ServerAliveInterval=30
     -o ServerAliveCountMax=3
     -o ExitOnForwardFailure=yes
+    -p "${SSH_PORT}"
 )
 
-if [[ $USE_MULTIPASS_EXEC -eq 0 ]]; then
-    SSH_CMD=(ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "ubuntu@${VM_IP}")
+if [[ -n "${SSH_KEY}" ]]; then
+    SSH_CMD=(ssh "${SSH_OPTS[@]}" -i "${SSH_KEY}" "${SSH_USER}@${TARGET_IP}")
 else
-    # Build a wrapper that tunnels via `multipass exec` — less reliable but
-    # works when the key path cannot be determined.
-    SSH_CMD=(ssh "${SSH_OPTS[@]}" "ubuntu@${VM_IP}")
+    warn "Could not locate SSH key — attempting connection without explicit key."
+    SSH_CMD=(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${TARGET_IP}")
 fi
 
+log "Tunnel: localhost:${LOCAL_PORT} → ${TARGET_IP}:${REMOTE_TEMPORAL_PORT}"
+print_mode_banner
+echo ""
+
 # ---------------------------------------------------------------------------
-# Kill any stale backgrounded tunnel for this port
+# Kill any stale backgrounded tunnel
 # ---------------------------------------------------------------------------
 if [[ -f "$PID_FILE" ]]; then
     OLD_PID=$(cat "$PID_FILE")
@@ -186,21 +174,20 @@ if [[ $BACKGROUND -eq 1 ]]; then
     TUNNEL_PID=$!
     echo "$TUNNEL_PID" > "$PID_FILE"
 
-    # Give it a moment to establish
     sleep 2
     if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
         rm -f "$PID_FILE"
-        die "Tunnel process exited immediately. Check that the worker is running in the VM."
+        die "Tunnel process exited immediately. Is the Temporal server running on the target?"
     fi
 
-    ok "Tunnel is running in the background (PID ${TUNNEL_PID})."
+    ok "Tunnel running in the background (PID ${TUNNEL_PID})."
     ok "  Local endpoint : localhost:${LOCAL_PORT}"
-    ok "  Remote         : ${VM_IP}:${REMOTE_PORT}"
+    ok "  Remote         : ${TARGET_IP}:${REMOTE_TEMPORAL_PORT}"
     ok ""
     ok "  To stop the tunnel:"
     ok "    ./scripts/vm-port-forward.sh --stop"
 else
-    ok "Tunnel active — localhost:${LOCAL_PORT} → ${VM_IP}:${REMOTE_PORT}"
+    ok "Tunnel active — localhost:${LOCAL_PORT} → ${TARGET_IP}:${REMOTE_TEMPORAL_PORT}"
     ok "Press Ctrl-C to close the tunnel."
     echo ""
     "${SSH_CMD[@]}"

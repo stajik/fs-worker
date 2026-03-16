@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# vm-build.sh — Build the worker binary inside the Multipass VM
+# vm-build.sh — Build the fs-worker binary on the target
+#
+# Local mode  (default):  builds inside the Multipass VM
+# Remote mode (--remote): builds on the bare-metal SSH host defined in .env
 #
 # Usage:
-#   ./scripts/vm-build.sh [--release] [--clean]
+#   ./scripts/vm-build.sh [--remote] [--release] [--clean]
 #
+#   --remote    Target the SSH bare-metal host defined in .env
 #   --release   Build in release mode (default: debug)
 #   --clean     Run `cargo clean` before building
 # =============================================================================
@@ -12,44 +16,53 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VM_NAME="zfs-dev"
-VM_MOUNT_PATH="/home/ubuntu/worker"
-
-# ---------------------------------------------------------------------------
-# Colours
-# ---------------------------------------------------------------------------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-log()  { echo -e "${CYAN}[vm-build]${NC} $*"; }
-ok()   { echo -e "${GREEN}[vm-build]${NC} $*"; }
-warn() { echo -e "${YELLOW}[vm-build]${NC} $*"; }
-die()  { echo -e "${RED}[vm-build] ERROR:${NC} $*" >&2; exit 1; }
+LOG_PREFIX="[vm-build]"
+source "${SCRIPT_DIR}/lib.sh"
 
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
 RELEASE=0
 CLEAN=0
+
+parse_mode_flag "$@"
+set -- "${FILTERED_ARGS[@]}"
+
 for arg in "$@"; do
     case "$arg" in
         --release) RELEASE=1 ;;
-        --clean)   CLEAN=1 ;;
+        --clean)   CLEAN=1   ;;
         *) die "Unknown argument: $arg" ;;
     esac
 done
 
 # ---------------------------------------------------------------------------
-# Sanity checks
+# Validate mode and connectivity
 # ---------------------------------------------------------------------------
-command -v multipass &>/dev/null || die "multipass is not installed or not in PATH."
+validate_mode
+remote_check_reachable
 
-VM_STATE=$(multipass list --format csv 2>/dev/null | grep "^${VM_NAME}," | cut -d',' -f2 || true)
-[[ -z "$VM_STATE" ]]   && die "VM '${VM_NAME}' does not exist. Run ./scripts/vm-setup.sh first."
-[[ "$VM_STATE" != "Running" ]] && die "VM '${VM_NAME}' is not running. Start it with: multipass start ${VM_NAME}"
+WORK_DIR="$(remote_work_dir)"
+
+print_mode_banner
+echo ""
+
+# ---------------------------------------------------------------------------
+# In remote mode, sync the source to the host before building
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" == "remote" ]]; then
+    log "Syncing source to ${REMOTE_HOST}:${WORK_DIR} ..."
+    remote_copy "${PROJECT_DIR}/" "${WORK_DIR}/"
+    ok "Source synced."
+fi
+
+# ---------------------------------------------------------------------------
+# Optional clean
+# ---------------------------------------------------------------------------
+if [[ $CLEAN -eq 1 ]]; then
+    warn "Running cargo clean ..."
+    remote_cargo "cargo clean --manifest-path '${WORK_DIR}/Cargo.toml'"
+fi
 
 # ---------------------------------------------------------------------------
 # Build
@@ -62,31 +75,25 @@ else
     log "Building in debug mode ..."
 fi
 
-if [[ $CLEAN -eq 1 ]]; then
-    warn "Running cargo clean ..."
-    multipass exec "$VM_NAME" -- bash -c "
-        source \"\$HOME/.cargo/env\"
-        cargo clean --manifest-path ${VM_MOUNT_PATH}/Cargo.toml
-    "
-fi
-
-multipass exec "$VM_NAME" -- bash -c "
+remote_cargo "
     set -euo pipefail
-    source \"\$HOME/.cargo/env\"
 
     echo '--- Rust version ---'
     rustc --version
     cargo --version
 
     echo ''
-    echo '--- Building worker ---'
-    cargo build ${CARGO_FLAGS} --manifest-path ${VM_MOUNT_PATH}/Cargo.toml 2>&1
+    echo '--- Building fs-worker ---'
+    cargo build ${CARGO_FLAGS} --manifest-path '${WORK_DIR}/Cargo.toml' 2>&1
 "
 
+# ---------------------------------------------------------------------------
+# Done
+# ---------------------------------------------------------------------------
 if [[ $RELEASE -eq 1 ]]; then
-    BINARY="${VM_MOUNT_PATH}/target/release/worker"
+    BINARY="${WORK_DIR}/target/release/fs-worker"
 else
-    BINARY="${VM_MOUNT_PATH}/target/debug/worker"
+    BINARY="${WORK_DIR}/target/debug/fs-worker"
 fi
 
-ok "Build complete → ${BINARY} (inside VM)"
+ok "Build complete → ${BINARY} (on target)"

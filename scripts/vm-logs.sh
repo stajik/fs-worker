@@ -1,41 +1,36 @@
 #!/usr/bin/env bash
 # =============================================================================
-# vm-logs.sh — Tail the worker service logs inside the Multipass VM
+# vm-logs.sh — Tail the fs-worker service logs on the target
+#
+# Local mode  (default):  reads logs from the Multipass VM
+# Remote mode (--remote): reads logs from the bare-metal SSH host in .env
 #
 # Usage:
-#   ./scripts/vm-logs.sh [--lines <n>] [--no-follow] [--system]
+#   ./scripts/vm-logs.sh [--remote] [--lines <n>] [--no-follow] [--system]
 #
+#   --remote      Target the SSH bare-metal host defined in .env
 #   --lines <n>   Number of historical lines to show (default: 50)
 #   --no-follow   Print logs and exit instead of following
-#   --system      Show system journal for the worker.service unit only
-#                 (default: follow the raw process stdout when run in
-#                  foreground, or journald when run as a service)
+#   --system      Force journald output even if the process is running in
+#                 the foreground (default: auto-detect)
 # =============================================================================
 
 set -euo pipefail
 
-VM_NAME="zfs-dev"
-LINES=50
-FOLLOW=1
-SYSTEM=0
-
-# ---------------------------------------------------------------------------
-# Colours
-# ---------------------------------------------------------------------------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-log()  { echo -e "${CYAN}[vm-logs]${NC} $*"; }
-ok()   { echo -e "${GREEN}[vm-logs]${NC} $*"; }
-warn() { echo -e "${YELLOW}[vm-logs]${NC} $*"; }
-die()  { echo -e "${RED}[vm-logs] ERROR:${NC} $*" >&2; exit 1; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_PREFIX="[vm-logs]"
+source "${SCRIPT_DIR}/lib.sh"
 
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
+LINES=50
+FOLLOW=1
+SYSTEM=0
+
+parse_mode_flag "$@"
+set -- "${FILTERED_ARGS[@]}"
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --lines)
@@ -50,97 +45,86 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------------------------------------------------------------------------
-# Sanity checks
+# Validate mode and connectivity
 # ---------------------------------------------------------------------------
-command -v multipass &>/dev/null || die "multipass is not installed or not in PATH."
+validate_mode
+remote_check_reachable
 
-VM_STATE=$(multipass list --format csv 2>/dev/null | grep "^${VM_NAME}," | cut -d',' -f2 || true)
-[[ -z "$VM_STATE" ]]           && die "VM '${VM_NAME}' does not exist. Run ./scripts/vm-setup.sh first."
-[[ "$VM_STATE" != "Running" ]] && die "VM '${VM_NAME}' is not running. Start it with: multipass start ${VM_NAME}"
+print_mode_banner
+echo ""
 
 # ---------------------------------------------------------------------------
-# Decide whether the worker is running as a systemd service or not
+# Decide whether fs-worker is managed by systemd or running in the foreground
 # ---------------------------------------------------------------------------
 IS_SERVICE=0
-if multipass exec "$VM_NAME" -- sudo systemctl is-active --quiet worker.service 2>/dev/null; then
+if remote_service_active "fs-worker.service" 2>/dev/null; then
     IS_SERVICE=1
 fi
 
 if [[ $SYSTEM -eq 1 ]] || [[ $IS_SERVICE -eq 1 ]]; then
     # -------------------------------------------------------------------------
-    # journald path — worker is managed by systemd
+    # journald path — fs-worker is managed by systemd
     # -------------------------------------------------------------------------
     if [[ $IS_SERVICE -eq 1 ]]; then
-        log "worker.service is active — reading from journald."
+        log "fs-worker.service is active — reading from journald."
     else
         log "Reading from journald (--system flag set)."
     fi
 
-    JOURNALCTL_FLAGS="-u worker.service -n ${LINES} --no-pager --output=short-precise"
+    JOURNALCTL_FLAGS="-u fs-worker.service -n ${LINES} --no-pager --output=short-precise"
     if [[ $FOLLOW -eq 1 ]]; then
         JOURNALCTL_FLAGS="${JOURNALCTL_FLAGS} -f"
         log "Following logs (Ctrl-C to stop) ..."
         echo ""
     fi
 
-    multipass exec "$VM_NAME" -- sudo journalctl ${JOURNALCTL_FLAGS}
+    remote_exec_sudo "journalctl ${JOURNALCTL_FLAGS}"
 
 else
     # -------------------------------------------------------------------------
-    # Foreground path — look for a running worker process and attach to its
-    # output via /proc/<pid>/fd/1, or fall back to journald anyway.
+    # Foreground path — look for a running fs-worker process
     # -------------------------------------------------------------------------
-    WORKER_PID=$(multipass exec "$VM_NAME" -- bash -c "
-        pgrep -x worker 2>/dev/null | head -1 || true
-    ")
+    WORKER_PID=$(remote_exec "pgrep -x fs-worker 2>/dev/null | head -1 || true")
 
     if [[ -z "$WORKER_PID" ]]; then
-        warn "No running worker process found, and worker.service is not active."
+        warn "No running fs-worker process found, and fs-worker.service is not active."
         warn "Start the worker with:"
         warn "  ./scripts/vm-run.sh           (foreground)"
         warn "  ./scripts/vm-run.sh --detach  (background service)"
         exit 1
     fi
 
-    log "Found worker process PID ${WORKER_PID}."
+    log "Found fs-worker process PID ${WORKER_PID}."
 
-    # Check if the process has a log file redirected
-    LOG_FILE=$(multipass exec "$VM_NAME" -- bash -c "
-        # Check if stdout is redirected to a file
-        readlink /proc/${WORKER_PID}/fd/1 2>/dev/null || true
-    ")
+    # Check if stdout is redirected to a file
+    LOG_FILE=$(remote_exec "readlink /proc/${WORKER_PID}/fd/1 2>/dev/null || true")
 
     if [[ -n "$LOG_FILE" ]] && [[ "$LOG_FILE" != /dev/pts/* ]] && [[ "$LOG_FILE" != pipe:* ]]; then
-        # Output is going to a file — tail it
         log "Worker stdout → ${LOG_FILE}"
         if [[ $FOLLOW -eq 1 ]]; then
             log "Following log file (Ctrl-C to stop) ..."
             echo ""
-            multipass exec "$VM_NAME" -- tail -n "$LINES" -f "$LOG_FILE"
+            remote_exec "tail -n ${LINES} -f '${LOG_FILE}'"
         else
-            multipass exec "$VM_NAME" -- tail -n "$LINES" "$LOG_FILE"
+            remote_exec "tail -n ${LINES} '${LOG_FILE}'"
         fi
     else
-        # Output is a pipe or PTY — fall back to journald which captures it
-        # when run under systemd, or show a helpful message otherwise.
-        log "Worker stdout is a pipe/PTY (likely running in an interactive terminal)."
-        log "Falling back to journald for recent log entries ..."
+        # Stdout is a pipe/PTY — fall back to journald
+        log "Worker stdout is a pipe/PTY. Falling back to journald ..."
         echo ""
 
-        JOURNALCTL_FLAGS="-u worker.service -n ${LINES} --no-pager --output=short-precise"
+        JOURNALCTL_FLAGS="-u fs-worker.service -n ${LINES} --no-pager --output=short-precise"
         if [[ $FOLLOW -eq 1 ]]; then
             JOURNALCTL_FLAGS="${JOURNALCTL_FLAGS} -f"
             log "Following journald (Ctrl-C to stop) ..."
             echo ""
         fi
 
-        # journald may have nothing if the worker was started manually —
-        # show a fallback message if that's the case.
-        LOG_OUTPUT=$(multipass exec "$VM_NAME" -- sudo journalctl ${JOURNALCTL_FLAGS} 2>&1 || true)
+        LOG_OUTPUT=$(remote_exec_sudo "journalctl ${JOURNALCTL_FLAGS}" 2>&1 || true)
 
         if echo "$LOG_OUTPUT" | grep -q "No entries"; then
-            warn "journald has no entries for worker.service."
-            warn "If you started the worker with ./scripts/vm-run.sh (foreground),"
+            warn "journald has no entries for fs-worker.service."
+            warn "If the worker was started with ./scripts/vm-run.sh (foreground),"
             warn "the logs are in that terminal session."
             warn ""
             warn "To capture logs persistently, use:"
