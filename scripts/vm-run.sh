@@ -82,6 +82,12 @@ remote_exec "
 " || die "Binary '${BINARY}' not found on target."
 
 # ---------------------------------------------------------------------------
+# Ensure Temporal is reachable from the target
+# ---------------------------------------------------------------------------
+log "Checking Temporal connectivity ..."
+ensure_temporal_reachable
+
+# ---------------------------------------------------------------------------
 # Ensure ZFS pool is imported
 # ---------------------------------------------------------------------------
 log "Ensuring ZFS pool '${ZFS_POOL}' is available ..."
