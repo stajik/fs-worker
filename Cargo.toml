@@ -4,17 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.102"
+futures = "0.3.32"
 libc = "0.2.183"
 libzfs = "0.6.16"
 libzfs-sys = "0.5.11"
 nvpair = "0.5.0"
 nvpair-sys = "0.4.0"
-prost = "0.14.3"
+serde = { version = "1.0.228", features = ["derive"] }
+temporalio-client = "0.1.0"
+temporalio-common = "0.1.0"
+temporalio-macros = "0.1.0"
+temporalio-sdk = "0.1.0-alpha.1"
+temporalio-sdk-core = "0.1.0"
 tokio = { version = "1.50.0", features = ["full"] }
-tonic = "0.14.5"
-tonic-prost = "0.14.5"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zfs-core = "0.5.0"
-
-[build-dependencies]
-tonic-build = "0.14.5"
-tonic-prost-build = "0.14.5"
