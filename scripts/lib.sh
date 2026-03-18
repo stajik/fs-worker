@@ -28,7 +28,7 @@
 #
 # Optional .env variables (all have defaults):
 #   REMOTE_PORT=22             # SSH port
-#   REMOTE_WORK_DIR=/home/ubuntu/fs-worker  # project dir on remote
+#   REMOTE_WORK_DIR=/home/worker/fs-worker  # project dir on remote
 #   VM_NAME=zfs-dev            # Multipass VM name (local mode only)
 #   ZFS_POOL=testpool          # ZFS pool name used by the worker
 # =============================================================================
@@ -103,13 +103,13 @@ load_env
 # Defaults (can be overridden in .env or environment)
 # ---------------------------------------------------------------------------
 VM_NAME="${VM_NAME:-zfs-dev}"
-VM_MOUNT_PATH="${VM_MOUNT_PATH:-/home/ubuntu/fs-worker}"
+VM_MOUNT_PATH="${VM_MOUNT_PATH:-/home/worker/fs-worker}"
 
 REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_USER="${REMOTE_USER:-ubuntu}"
 REMOTE_PEM="${REMOTE_PEM:-}"
 REMOTE_PORT="${REMOTE_PORT:-22}"
-REMOTE_WORK_DIR="${REMOTE_WORK_DIR:-/home/ubuntu/fs-worker}"
+REMOTE_WORK_DIR="${REMOTE_WORK_DIR:-/home/worker/fs-worker}"
 REMOTE_POOL_DEVICE="${REMOTE_POOL_DEVICE:-}"   # e.g. /dev/nvme1n1 — EBS volume on remote
 
 # AWS variables — only needed when interacting with AWS (e.g. security group updates)
@@ -118,6 +118,7 @@ AWS_PROFILE="${AWS_PROFILE:-}"
 AWS_SG_ID="${AWS_SG_ID:-}"
 
 ZFS_POOL="${ZFS_POOL:-testpool}"
+WORKER_USER="${WORKER_USER:-worker}"
 
 # ---------------------------------------------------------------------------
 # Mode detection
@@ -256,6 +257,18 @@ remote_exec_sudo() {
     fi
 }
 
+# remote_exec_as_worker <cmd-string>
+# Run a bash command on the target as the WORKER_USER.
+remote_exec_as_worker() {
+    local cmd="$1"
+    local wrapped="cd $(remote_work_dir) && ${cmd}"
+    if [[ "${MODE}" == "remote" ]]; then
+        ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "sudo -u ${WORKER_USER} bash -c $(printf '%q' "$wrapped")"
+    else
+        multipass exec "${VM_NAME}" -- sudo -u "${WORKER_USER}" bash -c "$wrapped"
+    fi
+}
+
 # remote_ip
 # Print the IP address / hostname of the target.
 remote_ip() {
@@ -300,10 +313,16 @@ remote_copy() {
 
         rsync -az \
             -e "${_ssh_wrapper}" \
+            --rsync-path='sudo rsync' \
             "${src}" \
             "${REMOTE_USER}@${REMOTE_HOST}:${dst}"
         local _rc=$?
         rm -f "${_ssh_wrapper}"
+        # Restore ownership to the worker user
+        if [[ $_rc -eq 0 ]]; then
+            ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
+                "sudo chown -R ${WORKER_USER}:${WORKER_USER} '${dst}'"
+        fi
         return $_rc
     else
         # Multipass has no direct rsync; use the shared mount (src is already
@@ -541,13 +560,13 @@ temporal_tunnel_stop() {
 }
 
 # ---------------------------------------------------------------------------
-# Cargo / Rust helpers (used by vm-build.sh)
+# Go helpers (used by vm-build.sh)
 # ---------------------------------------------------------------------------
 
-# Run a cargo command on the target, sourcing ~/.cargo/env first.
-remote_cargo() {
-    local cargo_cmd="$1"
-    remote_exec "source \"\$HOME/.cargo/env\" && ${cargo_cmd}"
+# Run a Go command on the target.
+remote_go() {
+    local go_cmd="$1"
+    remote_exec "${go_cmd}"
 }
 
 # ---------------------------------------------------------------------------

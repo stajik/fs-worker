@@ -9,8 +9,8 @@
 #   ./scripts/vm-build.sh [--remote] [--release] [--clean]
 #
 #   --remote    Target the SSH bare-metal host defined in .env
-#   --release   Build in release mode (default: debug)
-#   --clean     Run `cargo clean` before building
+#   --release   Build with optimisations (default: debug, with -N -l)
+#   --clean     Remove the previously built binary before building
 # =============================================================================
 
 set -euo pipefail
@@ -60,40 +60,39 @@ fi
 # Optional clean
 # ---------------------------------------------------------------------------
 if [[ $CLEAN -eq 1 ]]; then
-    warn "Running cargo clean ..."
-    remote_cargo "cargo clean --manifest-path '${WORK_DIR}/Cargo.toml'"
+    warn "Removing previous binary ..."
+    remote_go "rm -f '${WORK_DIR}/fs-worker'"
 fi
 
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
-CARGO_FLAGS=""
+BINARY="${WORK_DIR}/fs-worker"
+
 if [[ $RELEASE -eq 1 ]]; then
-    CARGO_FLAGS="--release"
     log "Building in release mode ..."
+    remote_exec_as_worker "
+        set -euo pipefail
+        export PATH=\$PATH:/usr/local/go/bin
+        echo '--- Go version ---'
+        go version
+        echo ''
+        echo '--- Building fs-worker (release) ---'
+        cd '${WORK_DIR}'
+        go build -o fs-worker . 2>&1
+    "
 else
     log "Building in debug mode ..."
-fi
-
-remote_cargo "
-    set -euo pipefail
-
-    echo '--- Rust version ---'
-    rustc --version
-    cargo --version
-
-    echo ''
-    echo '--- Building fs-worker ---'
-    cargo build ${CARGO_FLAGS} --manifest-path '${WORK_DIR}/Cargo.toml' 2>&1
-"
-
-# ---------------------------------------------------------------------------
-# Done
-# ---------------------------------------------------------------------------
-if [[ $RELEASE -eq 1 ]]; then
-    BINARY="${WORK_DIR}/target/release/fs-worker"
-else
-    BINARY="${WORK_DIR}/target/debug/fs-worker"
+    remote_exec_as_worker "
+        set -euo pipefail
+        export PATH=\$PATH:/usr/local/go/bin
+        echo '--- Go version ---'
+        go version
+        echo ''
+        echo '--- Building fs-worker (debug) ---'
+        cd '${WORK_DIR}'
+        go build -gcflags='all=-N -l' -o fs-worker . 2>&1
+    "
 fi
 
 ok "Build complete → ${BINARY} (on target)"

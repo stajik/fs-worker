@@ -64,16 +64,12 @@ fi
 # ---------------------------------------------------------------------------
 # Determine binary path
 # ---------------------------------------------------------------------------
-if [[ $RELEASE -eq 1 ]]; then
-    BINARY="${WORK_DIR}/target/release/fs-worker"
-    PROFILE="release"
-else
-    BINARY="${WORK_DIR}/target/debug/fs-worker"
-    PROFILE="debug"
-fi
+BINARY="${WORK_DIR}/fs-worker"
+PROFILE="release"
+[[ $RELEASE -eq 0 ]] && PROFILE="debug"
 
 # Verify the binary exists on the target
-remote_exec "
+remote_exec_as_worker "
     test -f '${BINARY}' || {
         echo 'Binary not found: ${BINARY}'
         echo 'Run ./scripts/vm-build.sh first, or pass --rebuild.'
@@ -134,10 +130,9 @@ log "  Press Ctrl-C to stop."
 echo ""
 
 # Kill any existing foreground fs-worker process
-remote_exec "pkill -x fs-worker 2>/dev/null && echo 'Stopped previous fs-worker process.' || true" || true
+remote_exec_as_worker "pkill -x fs-worker 2>/dev/null && echo 'Stopped previous fs-worker process.' || true" || true
 
-remote_exec "
-    export RUST_LOG=\${RUST_LOG:-info}
+remote_exec_as_worker "
     export ZFS_POOL='${ZFS_POOL}'
     exec '${BINARY}'
 "

@@ -1,7 +1,32 @@
-/target
+# Build output
+fs-worker
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace
+/vendor/
 
 # Local environment — contains SSH credentials, never commit
 .env
+.env.*
 
 # SSH tunnel PID written by vm-port-forward.sh
+scripts/.vm-tunnel.pid
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+scripts/.vm-temporal-tunnel.pid
 scripts/.vm-tunnel.pid
