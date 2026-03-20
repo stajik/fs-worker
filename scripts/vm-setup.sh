@@ -7,10 +7,11 @@
 #                         credentials are read from .env in the project root
 #
 # Usage:
-#   ./scripts/vm-setup.sh [--remote] [--recreate]
+#   ./scripts/vm-setup.sh [--remote] [--recreate] [--only-fc-init]
 #
-#   --remote     Target the SSH bare-metal host defined in .env
-#   --recreate   (local only) Delete and recreate the VM from scratch
+#   --remote        Target the SSH bare-metal host defined in .env
+#   --recreate      (local only) Delete and recreate the VM from scratch
+#   --only-fc-init  Only recreate the ext4 rootfs (re-bake _fc_init.sh)
 # =============================================================================
 
 set -euo pipefail
@@ -39,12 +40,14 @@ POOL_DEVICE="${REMOTE_POOL_DEVICE:-}"
 # Parse arguments
 # ---------------------------------------------------------------------------
 RECREATE=0
+ONLY_FC_INIT=0
 parse_mode_flag "$@"
 set -- "${FILTERED_ARGS[@]}"
 
 for arg in "$@"; do
     case "$arg" in
         --recreate) RECREATE=1 ;;
+        --only-fc-init) ONLY_FC_INIT=1 ;;
         *) die "Unknown argument: $arg" ;;
     esac
 done
@@ -54,6 +57,41 @@ WORK_DIR="$(remote_work_dir)"
 
 print_mode_banner
 echo ""
+
+# ---------------------------------------------------------------------------
+# --only-fc-init: skip everything and jump straight to rootfs rebuild
+# ---------------------------------------------------------------------------
+if [[ "${ONLY_FC_INIT}" -eq 1 ]]; then
+    log "Rebuilding ext4 rootfs (--only-fc-init) ..."
+    remote_exec_sudo "
+        set -euo pipefail
+
+        FC_DIR=/opt/firecracker
+        ROOTFS_EXT4_PATH=\${FC_DIR}/rootfs.ext4
+
+        echo 'Removing existing ext4 rootfs ...'
+        rm -f \"\${ROOTFS_EXT4_PATH}\"
+
+        echo 'Building ext4 rootfs from squashfs ...'
+        WORK_TMP=\$(mktemp -d)
+        unsquashfs -d \"\${WORK_TMP}/squashfs-root\" \"\${FC_DIR}/rootfs.squashfs\"
+
+        mkdir -p \"\${WORK_TMP}/squashfs-root/data\"
+
+        cp '${WORK_DIR}/scripts/_fc_init.sh' \"\${WORK_TMP}/squashfs-root/_fc_init.sh\"
+        chmod 755 \"\${WORK_TMP}/squashfs-root/_fc_init.sh\"
+
+        chown -R root:root \"\${WORK_TMP}/squashfs-root\"
+        truncate -s 1G \"\${ROOTFS_EXT4_PATH}\"
+        mkfs.ext4 -d \"\${WORK_TMP}/squashfs-root\" -F \"\${ROOTFS_EXT4_PATH}\"
+
+        rm -rf \"\${WORK_TMP}\"
+        chown '${WORKER_USER}:${WORKER_USER}' \"\${ROOTFS_EXT4_PATH}\"
+        echo 'Ext4 rootfs rebuilt at '\"\${ROOTFS_EXT4_PATH}\"'.'
+    "
+    ok "Ext4 rootfs recreated."
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Remote mode: ensure our current IP is allowed in the security group before
@@ -150,11 +188,14 @@ log "Updating apt and installing system dependencies ..."
 remote_exec_sudo "
     export DEBIAN_FRONTEND=noninteractive
 
-    PKGS='zfsutils-linux curl git rsync'
+    PKGS='zfsutils-linux curl git rsync squashfs-tools'
 
-    # Only pull in zfs-dkms if the kernel doesn't already ship zfs.ko
-    if ! modinfo zfs &>/dev/null; then
+    # Only pull in zfs-dkms if the kernel doesn't ship zfs.ko on disk.
+    # modinfo can fail if the module isn't loaded yet, so check the file directly.
+    if ! find /lib/modules/\$(uname -r) -name 'zfs.ko*' 2>/dev/null | grep -q .; then
         PKGS=\"\${PKGS} zfs-dkms\"
+    else
+        echo 'Kernel has zfs.ko built-in — skipping zfs-dkms.'
     fi
 
     # Skip apt round-trip when every package is already installed
@@ -183,6 +224,11 @@ remote_exec_sudo "
     # Ensure work directory exists and is owned by worker
     mkdir -p '${WORK_DIR}'
     chown -R '${WORKER_USER}:${WORKER_USER}' '${WORK_DIR}'
+
+    # Grant passwordless sudo for zfs mount/unmount and mount/umount
+    printf '%s ALL=(root) NOPASSWD: /usr/sbin/zfs mount *, /usr/sbin/zfs unmount *, /usr/sbin/zfs mount, /usr/sbin/zfs unmount, /usr/bin/mount, /usr/bin/umount\n' \
+        '${WORKER_USER}' | tee /etc/sudoers.d/${WORKER_USER}-zfs >/dev/null
+    chmod 440 /etc/sudoers.d/${WORKER_USER}-zfs
 "
 ok "User '${WORKER_USER}' ready."
 
@@ -251,13 +297,19 @@ if [[ "${MODE}" == "remote" ]]; then
         zpool create -f '${POOL_NAME}' '${POOL_DEVICE}'
         zpool status '${POOL_NAME}'
         echo 'ZFS pool created successfully on ${POOL_DEVICE}.'
+
+        # Set pool mountpoint to a directory the worker user can write to
+        mkdir -p '/mnt/${POOL_NAME}'
+        zfs set mountpoint='/mnt/${POOL_NAME}' '${POOL_NAME}'
+        chown '${WORKER_USER}:${WORKER_USER}' '/mnt/${POOL_NAME}'
+        echo 'Pool mountpoint set to /mnt/${POOL_NAME}.'
     "
     ok "ZFS pool '${POOL_NAME}' is ready on ${POOL_DEVICE}."
 
     # Grant worker user full ZFS permissions on the pool
     log "Granting ZFS permissions to '${WORKER_USER}' on '${POOL_NAME}' ..."
     remote_exec_sudo "
-        zfs allow -u '${WORKER_USER}' clone,create,destroy,mount,snapshot,rollback,send,receive,hold,release,refreservation '${POOL_NAME}'
+        zfs allow -u '${WORKER_USER}' clone,create,destroy,mount,snapshot,rollback,send,receive,hold,release,refreservation,canmount,mountpoint '${POOL_NAME}'
         echo 'ZFS permissions granted.'
         zfs allow '${POOL_NAME}'
     "
@@ -311,13 +363,19 @@ else
         zpool create -f '${POOL_NAME}' \"\${LOOP_DEV}\"
         zpool status '${POOL_NAME}'
         echo 'ZFS pool created successfully.'
+
+        # Set pool mountpoint to a directory the worker user can write to
+        mkdir -p '/mnt/${POOL_NAME}'
+        zfs set mountpoint='/mnt/${POOL_NAME}' '${POOL_NAME}'
+        chown '${WORKER_USER}:${WORKER_USER}' '/mnt/${POOL_NAME}'
+        echo 'Pool mountpoint set to /mnt/${POOL_NAME}.'
     "
     ok "ZFS pool '${POOL_NAME}' is ready."
 
     # Grant worker user full ZFS permissions on the pool
     log "Granting ZFS permissions to '${WORKER_USER}' on '${POOL_NAME}' ..."
     remote_exec_sudo "
-        zfs allow -u '${WORKER_USER}' clone,create,destroy,mount,snapshot,rollback,send,receive,hold,release,refreservation '${POOL_NAME}'
+        zfs allow -u '${WORKER_USER}' clone,create,destroy,mount,snapshot,rollback,send,receive,hold,release,refreservation,canmount,mountpoint '${POOL_NAME}'
         echo 'ZFS permissions granted.'
         zfs allow '${POOL_NAME}'
     "
@@ -401,6 +459,146 @@ remote_exec_sudo "
     echo 'Base volume created and snapshotted.'
 "
 ok "Base volume '${POOL_NAME}/_base/vol@empty' is ready."
+
+# ---------------------------------------------------------------------------
+# Step: Pre-formatted base ext4 image for zds branches
+# ---------------------------------------------------------------------------
+log "Setting up pre-formatted base data image '/opt/firecracker/base-data.img' ..."
+
+remote_exec_sudo "
+    set -euo pipefail
+
+    BASE_IMG=/opt/firecracker/base-data.img
+
+    if [ -f "\${BASE_IMG}" ]; then
+        echo 'Base data image already exists — skipping.'
+        exit 0
+    fi
+
+    # Create a sparse 1 GiB image and format it with ext4
+    truncate -s 1G "\${BASE_IMG}"
+    mkfs.ext4 -F -q "\${BASE_IMG}"
+
+    chown '${WORKER_USER}:${WORKER_USER}' \"\${BASE_IMG}\"
+    echo 'Base data image created at '\"\${BASE_IMG}\"'.'
+"
+ok "Base data image '/opt/firecracker/base-data.img' is ready."
+
+# ---------------------------------------------------------------------------
+# Step: Firecracker binary + kernel + rootfs
+# ---------------------------------------------------------------------------
+log "Installing Firecracker, kernel image, and rootfs ..."
+
+remote_exec_sudo "
+    set -euo pipefail
+
+    FC_DIR=/opt/firecracker
+    mkdir -p \"\${FC_DIR}\"
+    ARCH=\$(uname -m)
+    RELEASE_URL='https://github.com/firecracker-microvm/firecracker/releases'
+
+    # --- Firecracker binary ---
+    if /usr/local/bin/firecracker --version &>/dev/null; then
+        echo \"Firecracker already installed: \$(/usr/local/bin/firecracker --version | head -1)\"
+    else
+        LATEST_VERSION=\$(basename \$(curl -fsSLI -o /dev/null -w %{url_effective} \${RELEASE_URL}/latest))
+        echo \"Downloading Firecracker \${LATEST_VERSION} (\${ARCH}) ...\"
+        curl -fsSL \"\${RELEASE_URL}/download/\${LATEST_VERSION}/firecracker-\${LATEST_VERSION}-\${ARCH}.tgz\" | tar -xz -C /tmp
+        mv /tmp/release-\${LATEST_VERSION}-\${ARCH}/firecracker-\${LATEST_VERSION}-\${ARCH} /usr/local/bin/firecracker
+        chmod +x /usr/local/bin/firecracker
+        rm -rf /tmp/release-\${LATEST_VERSION}-\${ARCH}
+        echo \"Firecracker \${LATEST_VERSION} installed.\"
+    fi
+
+    # Resolve CI version prefix for S3 bucket
+    LATEST_VERSION=\$(basename \$(curl -fsSLI -o /dev/null -w %{url_effective} \${RELEASE_URL}/latest))
+    CI_VERSION=\${LATEST_VERSION%.*}
+
+    # --- Kernel image ---
+    KERNEL_PATH=\${FC_DIR}/vmlinux
+    if [ -f \"\${KERNEL_PATH}\" ]; then
+        echo \"Kernel image already present at \${KERNEL_PATH} — skipping.\"
+    else
+        echo \"Resolving latest kernel from Firecracker CI S3 ...\"
+        LATEST_KERNEL_KEY=\$(curl -s \"http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/\${CI_VERSION}/\${ARCH}/vmlinux-&list-type=2\" \
+            | grep -oP '(?<=<Key>)(firecracker-ci/'\${CI_VERSION}'/'\${ARCH}'/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3})(?=</Key>)' \
+            | sort -V | tail -1)
+
+        if [ -z \"\${LATEST_KERNEL_KEY}\" ]; then
+            echo 'ERROR: could not resolve kernel from S3' >&2
+            exit 1
+        fi
+
+        echo \"Downloading kernel: \${LATEST_KERNEL_KEY} ...\"
+        curl -fsSL -o \"\${KERNEL_PATH}\" \"https://s3.amazonaws.com/spec.ccfc.min/\${LATEST_KERNEL_KEY}\"
+        echo \"Kernel image installed at \${KERNEL_PATH}.\"
+    fi
+
+    # --- Root filesystem image (read-only squashfs) ---
+    ROOTFS_PATH=\${FC_DIR}/rootfs.squashfs
+    if [ -f \"\${ROOTFS_PATH}\" ]; then
+        echo \"Root filesystem already present at \${ROOTFS_PATH} — skipping.\"
+    else
+        echo \"Resolving latest Ubuntu rootfs from Firecracker CI S3 ...\"
+
+        LATEST_UBUNTU_KEY=\$(curl -s \"http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/\${CI_VERSION}/\${ARCH}/ubuntu-&list-type=2\" \
+            | grep -oP '(?<=<Key>)(firecracker-ci/'\${CI_VERSION}'/'\${ARCH}'/ubuntu-[0-9]+\.[0-9]+\.squashfs)(?=</Key>)' \
+            | sort -V | tail -1)
+
+        if [ -z \"\${LATEST_UBUNTU_KEY}\" ]; then
+            echo 'ERROR: could not resolve rootfs from S3' >&2
+            exit 1
+        fi
+
+        echo \"Downloading rootfs: \${LATEST_UBUNTU_KEY} ...\"
+        curl -fsSL -o \"\${ROOTFS_PATH}\" \"https://s3.amazonaws.com/spec.ccfc.min/\${LATEST_UBUNTU_KEY}\"
+        echo \"Root filesystem installed at \${ROOTFS_PATH}.\"
+    fi
+
+    # --- Root filesystem image (writable ext4) ---
+    ROOTFS_EXT4_PATH=\${FC_DIR}/rootfs.ext4
+    if [ -f \"\${ROOTFS_EXT4_PATH}\" ]; then
+        echo \"Ext4 rootfs already present at \${ROOTFS_EXT4_PATH} — skipping.\"
+    else
+        echo \"Building ext4 rootfs from squashfs ...\"
+
+        WORK_TMP=\$(mktemp -d)
+        unsquashfs -d \"\${WORK_TMP}/squashfs-root\" \"\${FC_DIR}/rootfs.squashfs\"
+
+        # Create /data mount point inside rootfs
+        mkdir -p \"\${WORK_TMP}/squashfs-root/data\"
+
+        # Copy the FC init script into the rootfs
+        cp '${WORK_DIR}/scripts/_fc_init.sh' \"\${WORK_TMP}/squashfs-root/_fc_init.sh\"
+        chmod 755 \"\${WORK_TMP}/squashfs-root/_fc_init.sh\"
+
+        chown -R root:root \"\${WORK_TMP}/squashfs-root\"
+        truncate -s 1G \"\${ROOTFS_EXT4_PATH}\"
+        mkfs.ext4 -d \"\${WORK_TMP}/squashfs-root\" -F \"\${ROOTFS_EXT4_PATH}\"
+
+        rm -rf \"\${WORK_TMP}\"
+        echo \"Ext4 rootfs installed at \${ROOTFS_EXT4_PATH}.\"
+    fi
+
+    # Ensure worker user owns firecracker assets (ext4 rootfs needs write access)
+    chown -R '${WORKER_USER}:${WORKER_USER}' \"\${FC_DIR}\"
+
+
+    # --- /dev/kvm access for worker user ---
+    if [ -e /dev/kvm ]; then
+        chown root:kvm /dev/kvm
+        chmod 660 /dev/kvm
+        usermod -aG kvm,disk '${WORKER_USER}' 2>/dev/null || true
+        echo 'Worker user added to kvm and disk groups.'
+    else
+        echo 'WARNING: /dev/kvm not found — Firecracker requires KVM support.'
+    fi
+
+    # --- Socket directory ---
+    mkdir -p /tmp/firecracker
+    chown '${WORKER_USER}:${WORKER_USER}' /tmp/firecracker
+"
+ok "Firecracker, kernel, and rootfs ready."
 
 # ---------------------------------------------------------------------------
 # Step: Worker systemd service (both modes)

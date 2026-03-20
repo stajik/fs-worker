@@ -3,6 +3,10 @@ package activities
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 
 	"go.temporal.io/sdk/activity"
 )
@@ -59,11 +63,37 @@ func (a *FsWorkerActivities) InitBranch(ctx context.Context, input InitBranchInp
 			return fmt.Errorf("create dataset %q: %w", dataset, err)
 		}
 
-		logger.Info("InitBranch: done (zds)", "dataset", dataset)
+		// Pre-create the mountpoint directory so sudo zfs mount succeeds.
+		mp := datasetMountPoint(a.pool, input.ID)
+		if err := os.MkdirAll(mp, 0755); err != nil {
+			return fmt.Errorf("create mountpoint %q: %w", mp, err)
+		}
+
+		// zfs mount requires root on Linux; worker has narrow sudo for this.
+		if err := mountDataset(dataset); err != nil {
+			return fmt.Errorf("mount dataset %q: %w", dataset, err)
+		}
+
+		// Copy the pre-formatted base data image into the dataset.
+		dst := filepath.Join(mp, dataImgName)
+		if err := copyFile(baseDataImgPath, dst); err != nil {
+			return fmt.Errorf("copy base data image to %q: %w", dst, err)
+		}
+
+		logger.Info("InitBranch: done (zds)", "dataset", dataset, "mountpoint", mp)
 		return nil
 
 	default:
 		// validateMode already rejects unknown modes, but the compiler needs this.
 		return fmt.Errorf("unsupported mode %q", input.Mode)
 	}
+}
+
+// copyFile copies src to dst preserving sparseness via cp --sparse=always.
+func copyFile(src, dst string) error {
+	out, err := exec.Command("cp", "--sparse=always", src, dst).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("cp --sparse=always %q %q: %s", src, dst, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

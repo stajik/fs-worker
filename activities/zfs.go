@@ -22,6 +22,10 @@ func datasetName(pool, id string) string {
 	return pool + "/" + id
 }
 
+func datasetMountPoint(pool, id string) string {
+	return "/mnt/" + pool + "/" + id
+}
+
 func zvolDevicePath(dataset string) string {
 	return "/dev/zvol/" + dataset
 }
@@ -74,6 +78,27 @@ func runZFS(args ...string) (string, error) {
 	return output, nil
 }
 
+func runSudoZFS(args ...string) (string, error) {
+	cmdArgs := append([]string{"zfs"}, args...)
+	out, err := exec.Command("sudo", cmdArgs...).CombinedOutput()
+	output := strings.TrimSpace(string(out))
+	if err != nil {
+		return "", fmt.Errorf("`sudo zfs %s` failed: %s", strings.Join(args, " "), output)
+	}
+	return output, nil
+}
+
+func mountDataset(dataset string) error {
+	_, err := runSudoZFS("mount", dataset)
+	if err != nil {
+		if strings.Contains(err.Error(), "already mounted") {
+			return nil
+		}
+		return fmt.Errorf("mount dataset %q: %w", dataset, err)
+	}
+	return nil
+}
+
 func cloneSnapshot(snapshot, target string) error {
 	_, err := runZFS("clone", "-o", "refreservation=none", snapshot, target)
 	if err != nil {
@@ -83,7 +108,7 @@ func cloneSnapshot(snapshot, target string) error {
 }
 
 func createDataset(dataset string) error {
-	_, err := runZFS("create", dataset)
+	_, err := runZFS("create", "-o", "canmount=noauto", dataset)
 	if err != nil {
 		return fmt.Errorf("zfs create %q: %w", dataset, err)
 	}

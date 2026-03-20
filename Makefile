@@ -54,6 +54,10 @@ setup:
 setup-recreate:
 	$(SCRIPTS)/vm-setup.sh --recreate
 
+## setup-fc-init: Only recreate the ext4 rootfs (re-bake _fc_init.sh)
+setup-fc-init:
+	$(SCRIPTS)/vm-setup.sh $(_REMOTE_FLAG) --only-fc-init
+
 ## provision: Provision an AWS EC2 a1.metal instance + EBS ZFS volume
 provision:
 	$(SCRIPTS)/vm-provision.sh
