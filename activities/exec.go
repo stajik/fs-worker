@@ -45,6 +45,7 @@ func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOut
 		"id", input.ID,
 		"mode", input.Mode,
 		"template_id", input.TemplateID,
+		"use_snapshot", input.UseSnapshot,
 		"cmd", input.Cmd,
 	)
 
@@ -66,8 +67,20 @@ func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOut
 		}
 	}
 
-	// Restore the VM from the template snapshot and send the command.
-	stdout, stderr, exitCode, vmErr := runFromSnapshot(vmCtx, input.ID, input.TemplateID, drivePath, input.Cmd)
+	var stdout, stderr, rawStdout, rawStderr string
+	var exitCode int
+	var vmErr error
+	if input.UseSnapshot {
+		stdout, stderr, exitCode, rawStdout, rawStderr, vmErr = runFromSnapshot(vmCtx, input.ID, input.TemplateID, drivePath, input.Cmd)
+	} else {
+		stdout, stderr, exitCode, rawStdout, rawStderr, vmErr = runFromTemplate(vmCtx, input.ID, input.TemplateID, drivePath, input.Cmd)
+	}
+
+	logger.Info("Exec: VM raw output",
+		"id", input.ID,
+		"raw_stdout", rawStdout,
+		"raw_stderr", rawStderr,
+	)
 
 	if vmErr != nil {
 		// If the VM context timed out but the activity context is still alive,

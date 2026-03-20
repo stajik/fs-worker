@@ -67,7 +67,7 @@ func (a *FsWorkerActivities) CreateTemplate(ctx context.Context, input CreateTem
 		}
 	}
 
-	vm, err := startFirecracker(vmCtx, "tpl-"+input.ID, cfg, "", "")
+	vm, err := startFirecracker(vmCtx, "tpl-"+input.ID, cfg, "")
 	if err != nil {
 		return CreateTemplateOutput{}, fmt.Errorf("start firecracker: %w", err)
 	}
@@ -130,8 +130,13 @@ func (a *FsWorkerActivities) CreateTemplate(ctx context.Context, input CreateTem
 	}
 	defer os.Remove(snapSocketPath)
 
+	// Ensure the cmd drive placeholder exists for snapshot capture.
+	if err := ensureCmdPlaceholder(); err != nil {
+		return CreateTemplateOutput{}, fmt.Errorf("ensure cmd placeholder: %w", err)
+	}
+
 	snapCfg := buildSnapshotCaptureConfig(snapSocketPath, squashfsPath)
-	snapVM, err := startFirecracker(ctx, "tpl-snap-"+input.ID, snapCfg, "===FC_READY===", "")
+	snapVM, err := startFirecracker(ctx, "tpl-snap-"+input.ID, snapCfg, "===FC_READY===")
 	if err != nil {
 		return CreateTemplateOutput{}, fmt.Errorf("start snapshot VM: %w", err)
 	}
@@ -142,8 +147,19 @@ func (a *FsWorkerActivities) CreateTemplate(ctx context.Context, input CreateTem
 	select {
 	case <-snapDone:
 		// VM exited before it became ready — skip snapshot.
-		logger.Warn("CreateTemplate: snapshot VM exited before ready, skipping VM snapshot", "id", input.ID)
+		snapRawStdout, snapRawStderr := snapVM.rawOutput()
+		logger.Warn("CreateTemplate: snapshot VM exited before ready, skipping VM snapshot",
+			"id", input.ID,
+			"raw_stdout", snapRawStdout,
+			"raw_stderr", snapRawStderr,
+		)
 	case <-snapVM.stdoutBuf.Ready():
+		snapRawStdout, snapRawStderr := snapVM.rawOutput()
+		logger.Info("CreateTemplate: snapshot VM ready, raw output",
+			"id", input.ID,
+			"raw_stdout", snapRawStdout,
+			"raw_stderr", snapRawStderr,
+		)
 		// VM printed ===FC_READY=== — pause and snapshot immediately.
 		if err := snapVM.machine.PauseVM(ctx); err != nil {
 			logger.Warn("CreateTemplate: failed to pause VM, skipping snapshot", "id", input.ID, "error", err)
@@ -154,6 +170,12 @@ func (a *FsWorkerActivities) CreateTemplate(ctx context.Context, input CreateTem
 		}
 		_ = snapVM.machine.StopVMM()
 	case <-ctx.Done():
+		snapRawStdout, snapRawStderr := snapVM.rawOutput()
+		logger.Warn("CreateTemplate: snapshot VM timed out",
+			"id", input.ID,
+			"raw_stdout", snapRawStdout,
+			"raw_stderr", snapRawStderr,
+		)
 		_ = snapVM.machine.StopVMM()
 		return CreateTemplateOutput{}, ctx.Err()
 	}

@@ -63,6 +63,14 @@ echo ""
 # ---------------------------------------------------------------------------
 if [[ "${ONLY_FC_INIT}" -eq 1 ]]; then
     log "Rebuilding ext4 rootfs (--only-fc-init) ..."
+
+    # In remote mode the project source is not live-mounted, so sync the
+    # scripts directory first to ensure the latest _fc_init.sh is on disk.
+    if [[ "${MODE}" == "remote" ]]; then
+        log "Syncing scripts to remote ..."
+        remote_copy "${PROJECT_DIR}/scripts/" "${WORK_DIR}/scripts/"
+    fi
+
     remote_exec_sudo "
         set -euo pipefail
 

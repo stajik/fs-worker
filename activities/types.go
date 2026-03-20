@@ -41,6 +41,11 @@ type ExecInput struct {
 
 	// Cmd is the command (shell script) to execute inside the Firecracker microVM.
 	Cmd string `json:"cmd"`
+
+	// UseSnapshot, if true, restores the VM from the template snapshot instead
+	// of cold-booting. Useful for benchmarking snapshot vs cold-boot latency.
+	// Defaults to false (cold boot).
+	UseSnapshot bool `json:"use_snapshot,omitempty"`
 }
 
 // ExecOutput is the result returned by the Exec activity.

@@ -44,6 +44,11 @@ const (
 	// baseDataImgPath is the pre-formatted ext4 image created by vm-setup.sh.
 	// It is copied into each zds dataset mountpoint during InitBranch.
 	baseDataImgPath = "/opt/firecracker/base-data.img"
+
+	// cmdPlaceholderPath is a small empty file used as the "cmd" drive
+	// placeholder during snapshot capture. On restore it is replaced with
+	// a file containing the actual base64-encoded command.
+	cmdPlaceholderPath = "/opt/firecracker/cmd-placeholder.img"
 )
 
 // templateDirFor returns the directory for a given template ID.
@@ -100,6 +105,37 @@ func newSocketPath(id string) (string, error) {
 	return filepath.Join(socketDir, fmt.Sprintf("fc-%s.sock", id)), nil
 }
 
+// ensureCmdPlaceholder creates the small placeholder file used as the "cmd"
+// drive during snapshot capture. It is a no-op if the file already exists.
+func ensureCmdPlaceholder() error {
+	if _, err := os.Stat(cmdPlaceholderPath); err == nil {
+		return nil
+	}
+	return os.WriteFile(cmdPlaceholderPath, make([]byte, 512), 0644)
+}
+
+// writeCmdDriveFile creates a temporary file containing the base64-encoded
+// command for use as the "cmd" drive on snapshot restore. The caller must
+// remove the file when done.
+func writeCmdDriveFile(cmd string) (string, error) {
+	cmdB64 := base64.StdEncoding.EncodeToString([]byte(cmd))
+	f, err := os.CreateTemp("", "fc-cmd-*")
+	if err != nil {
+		return "", fmt.Errorf("create cmd drive temp file: %w", err)
+	}
+	// Write the base64 command followed by a newline, then pad to 512 bytes
+	// so the block device has a clean sector-aligned size.
+	buf := make([]byte, 512)
+	copy(buf, cmdB64+"\n")
+	if _, err := f.Write(buf); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", fmt.Errorf("write cmd drive: %w", err)
+	}
+	f.Close()
+	return f.Name(), nil
+}
+
 // ---------------------------------------------------------------------------
 // Machine config builders
 // ---------------------------------------------------------------------------
@@ -134,13 +170,12 @@ func buildTemplateMachineConfig(socketPath, rootfsCopyPath, cmd string) firecrac
 	}
 }
 
-// buildSnapshotCaptureConfig builds a Firecracker config for snapshot capture:
-// read-only squashfs rootfs + a data drive placeholder, no fc_cmd (snapshot mode).
-// The VM boots, prints ===FC_READY===, and blocks on serial read.
-// The data drive uses baseDataImgPath as a dummy so the drive layout matches
-// what buildSnapshotRestoreConfig provides on restore.
-func buildSnapshotCaptureConfig(socketPath, squashfsPath string) firecracker.Config {
-	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off quiet init=/_fc_init.sh fc_nodata=1"
+// buildExecConfig builds a Firecracker config for executing a command:
+// read-only squashfs rootfs (from a template) + writable data drive, with the
+// command passed via boot args. This is a cold boot — no snapshot restore.
+func buildExecConfig(socketPath, squashfsPath, dataDrivePath, cmd string) firecracker.Config {
+	cmdB64 := base64.StdEncoding.EncodeToString([]byte(cmd))
+	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off quiet init=/_fc_init.sh fc_cmd=" + cmdB64
 
 	rootDriveID := "rootfs"
 	dataDriveID := "data"
@@ -148,7 +183,50 @@ func buildSnapshotCaptureConfig(socketPath, squashfsPath string) firecracker.Con
 	notRootDevice := false
 	readOnly := true
 	readWrite := false
+
+	return firecracker.Config{
+		SocketPath:      socketPath,
+		KernelImagePath: defaultKernelPath,
+		KernelArgs:      bootArgs,
+		MachineCfg: models.MachineConfiguration{
+			VcpuCount:  firecracker.Int64(vcpuCount),
+			MemSizeMib: firecracker.Int64(memSizeMiB),
+			Smt:        firecracker.Bool(false),
+		},
+		Drives: []models.Drive{
+			{
+				DriveID:      &rootDriveID,
+				PathOnHost:   &squashfsPath,
+				IsRootDevice: &isRootDevice,
+				IsReadOnly:   &readOnly,
+			},
+			{
+				DriveID:      &dataDriveID,
+				PathOnHost:   &dataDrivePath,
+				IsRootDevice: &notRootDevice,
+				IsReadOnly:   &readWrite,
+			},
+		},
+	}
+}
+
+// buildSnapshotCaptureConfig builds a Firecracker config for snapshot capture:
+// read-only squashfs rootfs + a data drive placeholder + a cmd drive placeholder.
+// The VM boots, prints ===FC_READY===, and blocks reading the cmd drive.
+// The data and cmd drives use placeholders so the drive layout matches
+// what buildSnapshotRestoreConfig provides on restore.
+func buildSnapshotCaptureConfig(socketPath, squashfsPath string) firecracker.Config {
+	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off quiet init=/_fc_init.sh fc_nodata=1"
+
+	rootDriveID := "rootfs"
+	dataDriveID := "data"
+	cmdDriveID := "cmd"
+	isRootDevice := true
+	notRootDevice := false
+	readOnly := true
+	readWrite := false
 	dummyDataPath := baseDataImgPath
+	dummyCmdPath := cmdPlaceholderPath
 
 	return firecracker.Config{
 		SocketPath:      socketPath,
@@ -172,16 +250,25 @@ func buildSnapshotCaptureConfig(socketPath, squashfsPath string) firecracker.Con
 				IsRootDevice: &notRootDevice,
 				IsReadOnly:   &readWrite,
 			},
+			{
+				DriveID:      &cmdDriveID,
+				PathOnHost:   &dummyCmdPath,
+				IsRootDevice: &notRootDevice,
+				IsReadOnly:   &readOnly,
+			},
 		},
 	}
 }
 
 // buildSnapshotRestoreConfig builds a Firecracker config that restores a VM
-// from a previously captured snapshot. The squashfs rootfs and data drive must
-// be provided so Firecracker can re-attach the backing files.
-func buildSnapshotRestoreConfig(socketPath, squashfsPath, dataDrivePath, snapshotPath, memFilePath string) firecracker.Config {
+// from a previously captured snapshot. The squashfs rootfs, data drive, and
+// cmd drive must be provided so Firecracker can re-attach the backing files.
+// The cmd drive contains the base64-encoded command that the init script reads
+// from /dev/vdc on resume.
+func buildSnapshotRestoreConfig(socketPath, squashfsPath, dataDrivePath, cmdDrivePath, snapshotPath, memFilePath string) firecracker.Config {
 	rootDriveID := "rootfs"
 	dataDriveID := "data"
+	cmdDriveID := "cmd"
 	isRootDevice := true
 	notRootDevice := false
 	readOnly := true
@@ -207,6 +294,12 @@ func buildSnapshotRestoreConfig(socketPath, squashfsPath, dataDrivePath, snapsho
 				PathOnHost:   &dataDrivePath,
 				IsRootDevice: &notRootDevice,
 				IsReadOnly:   &readWrite,
+			},
+			{
+				DriveID:      &cmdDriveID,
+				PathOnHost:   &cmdDrivePath,
+				IsRootDevice: &notRootDevice,
+				IsReadOnly:   &readOnly,
 			},
 		},
 		Snapshot: firecracker.SnapshotConfig{
@@ -276,11 +369,7 @@ type vmInstance struct {
 // cleaning up the socket path.
 // If marker is non-empty, the stdout writer will signal via Ready() when the
 // marker appears in the output stream.
-// If stdinPreload is non-empty, an OS pipe is created and the preload data is
-// written into the kernel pipe buffer BEFORE the VM starts. This guarantees
-// the data is available to the guest serial port immediately on resume —
-// critical for snapshot restore where the guest is blocked on serial read.
-func startFirecracker(ctx context.Context, id string, cfg firecracker.Config, marker string, stdinPreload string) (*vmInstance, error) {
+func startFirecracker(ctx context.Context, id string, cfg firecracker.Config, marker string) (*vmInstance, error) {
 	stdoutBuf := newMarkerWriter(marker)
 	stderrBuf := newMarkerWriter("")
 
@@ -290,25 +379,19 @@ func startFirecracker(ctx context.Context, id string, cfg firecracker.Config, ma
 		WithStdout(stdoutBuf).
 		WithStderr(stderrBuf)
 
-	if stdinPreload != "" {
-		fmt.Println("preloaded command")
-		// Use an OS pipe so writes are kernel-buffered (typically 64 KB on
-		// Linux). Writing the command before Start() ensures data is already
-		// in the pipe buffer when the VM resumes from a snapshot.
-		pr, pw, err := os.Pipe()
-		if err != nil {
-			return nil, fmt.Errorf("create stdin pipe: %w", err)
-		}
-		if _, err := fmt.Fprint(pw, stdinPreload); err != nil {
-			pw.Close()
-			pr.Close()
-			return nil, fmt.Errorf("preload stdin: %w", err)
-		}
-		builder = builder.WithStdin(pr)
-	}
-
 	machineOpts := []firecracker.Opt{
 		firecracker.WithProcessRunner(builder.Build(ctx)),
+	}
+
+	// When a snapshot is configured, pass WithSnapshot so the SDK uses the
+	// snapshot-load handler list instead of the normal boot flow.
+	snap := cfg.Snapshot
+	if snap.MemFilePath != "" && snap.SnapshotPath != "" {
+		machineOpts = append(machineOpts,
+			firecracker.WithSnapshot(snap.MemFilePath, snap.SnapshotPath, func(sc *firecracker.SnapshotConfig) {
+				sc.ResumeVM = snap.ResumeVM
+			}),
+		)
 	}
 
 	m, err := firecracker.NewMachine(ctx, cfg, machineOpts...)
@@ -340,41 +423,81 @@ func (v *vmInstance) rawOutput() (string, string) {
 }
 
 // ---------------------------------------------------------------------------
-// runFromSnapshot restores a VM from a template snapshot, sends the command
-// via stdin, and waits for the VM to exit.
+// runFromTemplate cold-boots a VM from a template's squashfs rootfs with the
+// command in kernel boot args. This avoids Firecracker snapshot restore, which
+// has reliability issues with serial console output and in-flight process
+// state. Cold boot from squashfs is ~125ms and fully reliable.
 // ---------------------------------------------------------------------------
 
-func runFromSnapshot(ctx context.Context, id, templateID, dataDrivePath, cmd string) (stdout, stderr string, exitCode int, err error) {
-	snapshotPath, memFilePath, squashfsPath, err := resolveTemplateArtifacts(templateID)
+func runFromTemplate(ctx context.Context, id, templateID, dataDrivePath, cmd string) (stdout, stderr string, exitCode int, rawStdout, rawStderr string, err error) {
+	_, _, squashfsPath, err := resolveTemplateArtifacts(templateID)
 	if err != nil {
-		return "", "", -1, fmt.Errorf("resolve template %q: %w", templateID, err)
+		return "", "", -1, "", "", fmt.Errorf("resolve template %q: %w", templateID, err)
 	}
 
 	socketPath, err := newSocketPath(id)
 	if err != nil {
-		return "", "", -1, err
+		return "", "", -1, "", "", err
 	}
 	defer os.Remove(socketPath)
 
-	cfg := buildSnapshotRestoreConfig(socketPath, squashfsPath, dataDrivePath, snapshotPath, memFilePath)
+	cfg := buildExecConfig(socketPath, squashfsPath, dataDrivePath, cmd)
 
-	// Pre-encode the command and write it into the stdin pipe buffer BEFORE
-	// the VM starts. The guest is blocked on `read -r CMD_B64 < /dev/ttyS0`
-	// and will consume this immediately on resume.
-	cmdB64 := base64.StdEncoding.EncodeToString([]byte(cmd))
-	vm, err := startFirecracker(ctx, id, cfg, "", cmdB64+"\n")
+	vm, err := startFirecracker(ctx, id, cfg, "")
 	if err != nil {
-		return "", "", -1, err
+		return "", "", -1, "", "", err
 	}
 
 	// Wait for the VM to execute and exit (reboot -f).
 	if err := vm.machine.Wait(ctx); err != nil {
-		rawStdout, rawStderr := vm.rawOutput()
-		return rawStdout, rawStderr, -1, fmt.Errorf("wait machine: %w", err)
+		rawStdout, rawStderr = vm.rawOutput()
+		return "", "", -1, rawStdout, rawStderr, fmt.Errorf("wait machine: %w", err)
 	}
 
+	rawStdout, rawStderr = vm.rawOutput()
 	stdout, stderr, exitCode = vm.output()
-	return stdout, stderr, exitCode, nil
+	return stdout, stderr, exitCode, rawStdout, rawStderr, nil
+}
+
+// ---------------------------------------------------------------------------
+// runFromSnapshot restores a VM from a template snapshot and waits for it to
+// exit. The command is delivered via a small block device (/dev/vdc). This is
+// kept alongside runFromTemplate for benchmarking snapshot vs cold-boot latency.
+// ---------------------------------------------------------------------------
+
+func runFromSnapshot(ctx context.Context, id, templateID, dataDrivePath, cmd string) (stdout, stderr string, exitCode int, rawStdout, rawStderr string, err error) {
+	snapshotPath, memFilePath, squashfsPath, err := resolveTemplateArtifacts(templateID)
+	if err != nil {
+		return "", "", -1, "", "", fmt.Errorf("resolve template %q: %w", templateID, err)
+	}
+
+	socketPath, err := newSocketPath(id)
+	if err != nil {
+		return "", "", -1, "", "", err
+	}
+	defer os.Remove(socketPath)
+
+	cmdDrivePath, err := writeCmdDriveFile(cmd)
+	if err != nil {
+		return "", "", -1, "", "", err
+	}
+	defer os.Remove(cmdDrivePath)
+
+	cfg := buildSnapshotRestoreConfig(socketPath, squashfsPath, dataDrivePath, cmdDrivePath, snapshotPath, memFilePath)
+
+	vm, err := startFirecracker(ctx, id, cfg, "")
+	if err != nil {
+		return "", "", -1, "", "", err
+	}
+
+	if err := vm.machine.Wait(ctx); err != nil {
+		rawStdout, rawStderr = vm.rawOutput()
+		return "", "", -1, rawStdout, rawStderr, fmt.Errorf("wait machine: %w", err)
+	}
+
+	rawStdout, rawStderr = vm.rawOutput()
+	stdout, stderr, exitCode = vm.output()
+	return stdout, stderr, exitCode, rawStdout, rawStderr, nil
 }
 
 // ---------------------------------------------------------------------------
