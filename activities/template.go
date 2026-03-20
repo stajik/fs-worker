@@ -130,12 +130,10 @@ func (a *FsWorkerActivities) CreateTemplate(ctx context.Context, input CreateTem
 	}
 	defer os.Remove(snapSocketPath)
 
-	// Ensure the cmd drive placeholder exists for snapshot capture.
-	if err := ensureCmdPlaceholder(); err != nil {
-		return CreateTemplateOutput{}, fmt.Errorf("ensure cmd placeholder: %w", err)
-	}
+	snapVsockUDS := vsockUDSPath("tpl-snap-" + input.ID)
+	defer os.Remove(snapVsockUDS)
 
-	snapCfg := buildSnapshotCaptureConfig(snapSocketPath, squashfsPath)
+	snapCfg := buildSnapshotCaptureConfig(snapSocketPath, squashfsPath, snapVsockUDS)
 	snapVM, err := startFirecracker(ctx, "tpl-snap-"+input.ID, snapCfg, "===FC_READY===")
 	if err != nil {
 		return CreateTemplateOutput{}, fmt.Errorf("start snapshot VM: %w", err)

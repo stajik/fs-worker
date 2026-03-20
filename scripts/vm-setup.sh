@@ -77,6 +77,13 @@ if [[ "${ONLY_FC_INIT}" -eq 1 ]]; then
         FC_DIR=/opt/firecracker
         ROOTFS_EXT4_PATH=\${FC_DIR}/rootfs.ext4
 
+        echo 'Compiling _fc_agent ...'
+        AGENT_BUILD=\$(mktemp -d)
+        cp -r '${WORK_DIR}/scripts/fc-agent/.' \"\${AGENT_BUILD}/\"
+        cd \"\${AGENT_BUILD}\"
+        CGO_ENABLED=0 go build -ldflags='-s -w' -o \"\${AGENT_BUILD}/_fc_agent\" .
+        echo '_fc_agent compiled.'
+
         echo 'Removing existing ext4 rootfs ...'
         rm -f \"\${ROOTFS_EXT4_PATH}\"
 
@@ -88,6 +95,10 @@ if [[ "${ONLY_FC_INIT}" -eq 1 ]]; then
 
         cp '${WORK_DIR}/scripts/_fc_init.sh' \"\${WORK_TMP}/squashfs-root/_fc_init.sh\"
         chmod 755 \"\${WORK_TMP}/squashfs-root/_fc_init.sh\"
+
+        cp \"\${AGENT_BUILD}/_fc_agent\" \"\${WORK_TMP}/squashfs-root/_fc_agent\"
+        chmod 755 \"\${WORK_TMP}/squashfs-root/_fc_agent\"
+        rm -rf \"\${AGENT_BUILD}\"
 
         chown -R root:root \"\${WORK_TMP}/squashfs-root\"
         truncate -s 1G \"\${ROOTFS_EXT4_PATH}\"
@@ -576,9 +587,19 @@ remote_exec_sudo "
         # Create /data mount point inside rootfs
         mkdir -p \"\${WORK_TMP}/squashfs-root/data\"
 
-        # Copy the FC init script into the rootfs
+        # Copy the FC init script and vsock agent into the rootfs
         cp '${WORK_DIR}/scripts/_fc_init.sh' \"\${WORK_TMP}/squashfs-root/_fc_init.sh\"
         chmod 755 \"\${WORK_TMP}/squashfs-root/_fc_init.sh\"
+
+        echo \"Compiling _fc_agent ...\"
+        AGENT_BUILD=\$(mktemp -d)
+        cp -r '${WORK_DIR}/scripts/fc-agent/.' \"\${AGENT_BUILD}/\"
+        cd \"\${AGENT_BUILD}\"
+        CGO_ENABLED=0 go build -ldflags='-s -w' -o \"\${AGENT_BUILD}/_fc_agent\" .
+        cp \"\${AGENT_BUILD}/_fc_agent\" \"\${WORK_TMP}/squashfs-root/_fc_agent\"
+        chmod 755 \"\${WORK_TMP}/squashfs-root/_fc_agent\"
+        rm -rf \"\${AGENT_BUILD}\"
+        echo \"_fc_agent compiled and installed.\"
 
         chown -R root:root \"\${WORK_TMP}/squashfs-root\"
         truncate -s 1G \"\${ROOTFS_EXT4_PATH}\"

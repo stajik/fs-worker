@@ -1,15 +1,18 @@
 package activities
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
 	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
@@ -45,10 +48,12 @@ const (
 	// It is copied into each zds dataset mountpoint during InitBranch.
 	baseDataImgPath = "/opt/firecracker/base-data.img"
 
-	// cmdPlaceholderPath is a small empty file used as the "cmd" drive
-	// placeholder during snapshot capture. On restore it is replaced with
-	// a file containing the actual base64-encoded command.
-	cmdPlaceholderPath = "/opt/firecracker/cmd-placeholder.img"
+	// vsockPort is the AF_VSOCK port that _fc_agent listens on inside the VM.
+	vsockPort = 52000
+
+	// vsockGuestCID is the CID assigned to the guest. Must be the same for
+	// snapshot capture and restore so the kernel vsock state is consistent.
+	vsockGuestCID = 3
 )
 
 // templateDirFor returns the directory for a given template ID.
@@ -105,35 +110,61 @@ func newSocketPath(id string) (string, error) {
 	return filepath.Join(socketDir, fmt.Sprintf("fc-%s.sock", id)), nil
 }
 
-// ensureCmdPlaceholder creates the small placeholder file used as the "cmd"
-// drive during snapshot capture. It is a no-op if the file already exists.
-func ensureCmdPlaceholder() error {
-	if _, err := os.Stat(cmdPlaceholderPath); err == nil {
-		return nil
-	}
-	return os.WriteFile(cmdPlaceholderPath, make([]byte, 512), 0644)
+// vsockUDSPath returns the host-side Unix domain socket path that Firecracker
+// uses to proxy vsock connections for the given instance ID.
+func vsockUDSPath(id string) string {
+	return filepath.Join(socketDir, fmt.Sprintf("vsock-%s.sock", id))
 }
 
-// writeCmdDriveFile creates a temporary file containing the base64-encoded
-// command for use as the "cmd" drive on snapshot restore. The caller must
-// remove the file when done.
-func writeCmdDriveFile(cmd string) (string, error) {
-	cmdB64 := base64.StdEncoding.EncodeToString([]byte(cmd))
-	f, err := os.CreateTemp("", "fc-cmd-*")
+// sendVsockCommand connects to the Firecracker vsock proxy UDS and delivers
+// the command to the _fc_agent running inside the VM.
+//
+// Firecracker vsock proxy protocol:
+//
+//	host → "CONNECT <port>\n"
+//	host ← "OK <port>\n"
+//	host → "<base64cmd>\n"
+//	host closes connection
+//
+// The function retries the dial for up to 3 seconds to allow Firecracker time
+// to create the UDS after the VM starts.
+func sendVsockCommand(vsockUDS, cmd string) error {
+	var conn net.Conn
+	var err error
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err = net.Dial("unix", vsockUDS)
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if err != nil {
-		return "", fmt.Errorf("create cmd drive temp file: %w", err)
+		return fmt.Errorf("dial vsock proxy %q: %w", vsockUDS, err)
 	}
-	// Write the base64 command followed by a newline, then pad to 512 bytes
-	// so the block device has a clean sector-aligned size.
-	buf := make([]byte, 512)
-	copy(buf, cmdB64+"\n")
-	if _, err := f.Write(buf); err != nil {
-		f.Close()
-		os.Remove(f.Name())
-		return "", fmt.Errorf("write cmd drive: %w", err)
+	defer conn.Close()
+
+	// Initiate the connection to the guest vsock port.
+	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", vsockPort); err != nil {
+		return fmt.Errorf("send CONNECT: %w", err)
 	}
-	f.Close()
-	return f.Name(), nil
+
+	// Read the acknowledgement.
+	reader := bufio.NewReader(conn)
+	resp, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read vsock ACK: %w", err)
+	}
+	if !strings.HasPrefix(resp, "OK ") {
+		return fmt.Errorf("unexpected vsock response: %q", resp)
+	}
+
+	// Send the base64-encoded command followed by a newline.
+	cmdB64 := base64.StdEncoding.EncodeToString([]byte(cmd))
+	if _, err := fmt.Fprintf(conn, "%s\n", cmdB64); err != nil {
+		return fmt.Errorf("send command: %w", err)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -211,22 +242,20 @@ func buildExecConfig(socketPath, squashfsPath, dataDrivePath, cmd string) firecr
 }
 
 // buildSnapshotCaptureConfig builds a Firecracker config for snapshot capture:
-// read-only squashfs rootfs + a data drive placeholder + a cmd drive placeholder.
-// The VM boots, prints ===FC_READY===, and blocks reading the cmd drive.
-// The data and cmd drives use placeholders so the drive layout matches
-// what buildSnapshotRestoreConfig provides on restore.
-func buildSnapshotCaptureConfig(socketPath, squashfsPath string) firecracker.Config {
+// read-only squashfs rootfs + a data drive placeholder + vsock device.
+// The VM boots, starts _fc_agent (vsock listener), and prints ===FC_READY===.
+// The data drive uses a placeholder so the drive layout matches restore.
+// The vsock UDS path is per-instance so concurrent captures don't collide.
+func buildSnapshotCaptureConfig(socketPath, squashfsPath, vsockUDS string) firecracker.Config {
 	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off quiet init=/_fc_init.sh fc_nodata=1"
 
 	rootDriveID := "rootfs"
 	dataDriveID := "data"
-	cmdDriveID := "cmd"
 	isRootDevice := true
 	notRootDevice := false
 	readOnly := true
 	readWrite := false
 	dummyDataPath := baseDataImgPath
-	dummyCmdPath := cmdPlaceholderPath
 
 	return firecracker.Config{
 		SocketPath:      socketPath,
@@ -250,25 +279,21 @@ func buildSnapshotCaptureConfig(socketPath, squashfsPath string) firecracker.Con
 				IsRootDevice: &notRootDevice,
 				IsReadOnly:   &readWrite,
 			},
-			{
-				DriveID:      &cmdDriveID,
-				PathOnHost:   &dummyCmdPath,
-				IsRootDevice: &notRootDevice,
-				IsReadOnly:   &readOnly,
-			},
+		},
+		VsockDevices: []firecracker.VsockDevice{
+			{ID: "vsock0", CID: vsockGuestCID, Path: vsockUDS},
 		},
 	}
 }
 
 // buildSnapshotRestoreConfig builds a Firecracker config that restores a VM
 // from a previously captured snapshot. The squashfs rootfs, data drive, and
-// cmd drive must be provided so Firecracker can re-attach the backing files.
-// The cmd drive contains the base64-encoded command that the init script reads
-// from /dev/vdc on resume.
-func buildSnapshotRestoreConfig(socketPath, squashfsPath, dataDrivePath, cmdDrivePath, snapshotPath, memFilePath string) firecracker.Config {
+// vsock UDS path must match the layout used during snapshot capture.
+// After restore _fc_agent (already in Accept()) receives the command via the
+// vsock proxy and the init script proceeds to execute it.
+func buildSnapshotRestoreConfig(socketPath, squashfsPath, dataDrivePath, vsockUDS, snapshotPath, memFilePath string) firecracker.Config {
 	rootDriveID := "rootfs"
 	dataDriveID := "data"
-	cmdDriveID := "cmd"
 	isRootDevice := true
 	notRootDevice := false
 	readOnly := true
@@ -295,12 +320,9 @@ func buildSnapshotRestoreConfig(socketPath, squashfsPath, dataDrivePath, cmdDriv
 				IsRootDevice: &notRootDevice,
 				IsReadOnly:   &readWrite,
 			},
-			{
-				DriveID:      &cmdDriveID,
-				PathOnHost:   &cmdDrivePath,
-				IsRootDevice: &notRootDevice,
-				IsReadOnly:   &readOnly,
-			},
+		},
+		VsockDevices: []firecracker.VsockDevice{
+			{ID: "vsock0", CID: vsockGuestCID, Path: vsockUDS},
 		},
 		Snapshot: firecracker.SnapshotConfig{
 			MemFilePath:  memFilePath,
@@ -477,17 +499,22 @@ func runFromSnapshot(ctx context.Context, id, templateID, dataDrivePath, cmd str
 	}
 	defer os.Remove(socketPath)
 
-	cmdDrivePath, err := writeCmdDriveFile(cmd)
-	if err != nil {
-		return "", "", -1, "", "", err
-	}
-	defer os.Remove(cmdDrivePath)
+	vsockUDS := vsockUDSPath(id)
+	defer os.Remove(vsockUDS)
 
-	cfg := buildSnapshotRestoreConfig(socketPath, squashfsPath, dataDrivePath, cmdDrivePath, snapshotPath, memFilePath)
+	cfg := buildSnapshotRestoreConfig(socketPath, squashfsPath, dataDrivePath, vsockUDS, snapshotPath, memFilePath)
 
 	vm, err := startFirecracker(ctx, id, cfg, "")
 	if err != nil {
 		return "", "", -1, "", "", err
+	}
+
+	// Deliver the command via the vsock proxy. _fc_agent is already blocked
+	// in Accept() inside the restored VM, so this completes quickly.
+	if err := sendVsockCommand(vsockUDS, cmd); err != nil {
+		_ = vm.machine.StopVMM()
+		rawStdout, rawStderr = vm.rawOutput()
+		return "", "", -1, rawStdout, rawStderr, fmt.Errorf("send vsock command: %w", err)
 	}
 
 	if err := vm.machine.Wait(ctx); err != nil {

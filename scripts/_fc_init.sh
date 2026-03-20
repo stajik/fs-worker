@@ -11,10 +11,11 @@
 #     init=/_fc_init.sh fc_cmd=ZWNobyBoZWxsbw==
 #
 # Snapshot mode (no fc_cmd in boot args):
-#   After mounts and cmdline parsing, prints ===FC_READY=== and enters a
-#   poll loop on /dev/vdc. The host pauses+snapshots during this loop.
-#   After restore the cmd drive has the real command; drop_caches ensures
-#   we bypass the stale page cache from the snapshot memory.
+#   Starts /_fc_agent (vsock listener on port 52000), waits 200ms for it to
+#   reach Accept(), then prints ===FC_READY===.  The host pauses+snapshots
+#   the VM while _fc_agent is blocked in Accept().  On restore the host
+#   connects via the Firecracker vsock UDS proxy, sends the base64 command,
+#   and _fc_agent writes it to /tmp/fc_cmd_b64 and exits.
 #   Boot args example:
 #     init=/_fc_init.sh fc_nodata=1
 
@@ -25,9 +26,8 @@ mount -t devtmpfs dev /dev 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mount -t tmpfs tmpfs /run 2>/dev/null
 
-# Parse kernel command line BEFORE the ready marker so that all fork-heavy
-# work (pipelines, subshells) is done before the snapshot point. This way
-# the snapshot captures the VM in a clean state inside the poll loop.
+# Parse kernel command line before any snapshot-related work so all
+# fork-heavy pipelines finish before the snapshot point.
 FC_NODATA=""
 FC_CMD=""
 for word in $(cat /proc/cmdline); do
@@ -47,36 +47,37 @@ if [ "$FC_NODATA" != "1" ]; then
     fi
 fi
 
-echo "===FC_READY==="
-
 if [ -n "$FC_CMD" ]; then
     # === COLD MODE: command in boot args ===
+    # ===FC_READY=== is not used by cold-boot callers but harmless to emit.
+    echo "===FC_READY==="
     echo "[fc_init] cold mode"
     CMD=$(echo "$FC_CMD" | base64 -d)
 else
-    # === SNAPSHOT MODE: command delivery via block device ===
-    # The host pauses+snapshots the VM while this loop spins.
-    # During capture /dev/vdc is a zero-filled placeholder so the loop
-    # keeps iterating. After restore the host swaps in a real cmd drive;
-    # drop_caches evicts only the stale /dev/vdc pages.
-    # Poll /dev/vdc using only shell builtins — no fork/exec in the loop.
-    # This is critical because the host snapshots the VM while this loop
-    # runs. If child processes (dd, tr, etc.) are in-flight at snapshot
-    # time, they hang on restore.
-    # `read` on the zero-filled placeholder returns empty (nulls are
-    # dropped by the shell). On the real cmd drive it returns the base64
-    # command (up to the newline).
-    echo "[fc_init] snapshot mode: polling /dev/vdc"
-    ITER=0
-    while true; do
-        ITER=$((ITER + 1))
-        echo 1 > /proc/sys/vm/drop_caches 2>/dev/null
-        CMD_B64=""
-        read -r CMD_B64 < /dev/vdc 2>/dev/null || true
-        echo "[fc_init] poll #${ITER}: len=${#CMD_B64}"
-        [ -n "$CMD_B64" ] && break
-    done
-    echo "[fc_init] got command after ${ITER} poll(s)"
+    # === SNAPSHOT MODE: command delivery via vsock ===
+    # Load the virtio vsock kernel module (may be built-in; errors are OK).
+    modprobe vsock 2>/dev/null || true
+    modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+
+    # Start the vsock agent listener in the background.  It binds and
+    # listens on vsock port 52000, then blocks in Accept() waiting for the
+    # host to connect after snapshot restore.
+    echo "[fc_init] snapshot mode: starting vsock agent"
+    /_fc_agent > /tmp/fc_cmd_b64 &
+    FC_AGENT_PID=$!
+
+    # Give the agent enough time to reach Accept() before we print the
+    # ready marker and the host captures the snapshot.
+    sleep 0.2
+
+    echo "===FC_READY==="
+
+    # Host pauses + snapshots the VM while _fc_agent is blocked in Accept().
+    # On restore the host connects, sends the base64 command, and the agent
+    # writes it to /tmp/fc_cmd_b64 and exits.
+    wait $FC_AGENT_PID
+    CMD_B64=$(cat /tmp/fc_cmd_b64)
+    echo "[fc_init] got command via vsock"
     CMD=$(echo "$CMD_B64" | base64 -d)
 fi
 
