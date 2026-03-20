@@ -1,2 +1,5 @@
 # SSH tunnel PID file written by vm-port-forward.sh
 .vm-tunnel.pid
+
+# Pre-built fc-agent binary (cross-compiled for Linux)
+fc-agent/_fc_agent_linux

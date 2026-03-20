@@ -47,7 +47,7 @@ endif
 # ---------------------------------------------------------------------------
 
 ## setup: Provision the target (VM or bare-metal): ZFS, Go, systemd units
-setup:
+setup: build-agent
 	$(SCRIPTS)/vm-setup.sh $(_REMOTE_FLAG)
 
 ## setup-recreate: Recreate the local Multipass VM from scratch
@@ -55,7 +55,7 @@ setup-recreate:
 	$(SCRIPTS)/vm-setup.sh --recreate
 
 ## setup-fc-init: Only recreate the ext4 rootfs (re-bake _fc_init.sh)
-setup-fc-init:
+setup-fc-init: build-agent
 	$(SCRIPTS)/vm-setup.sh $(_REMOTE_FLAG) --only-fc-init
 
 ## provision: Provision an AWS EC2 a1.metal instance + EBS ZFS volume
@@ -93,6 +93,10 @@ build-local:
 ## build-local-release: Build locally with full optimisations
 build-local-release:
 	go build -ldflags="-s -w" -o fs-worker .
+
+## build-agent: Cross-compile the fc-agent binary for linux/arm64
+build-agent:
+	cd scripts/fc-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o _fc_agent_linux .
 
 # ---------------------------------------------------------------------------
 # Run / stop
