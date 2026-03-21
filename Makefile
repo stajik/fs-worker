@@ -14,7 +14,7 @@
 #   make logs              Tail the worker logs
 #   make test              Run smoke tests against the running worker
 #   make shell             Open an interactive shell on the target
-#   make port-forward      Forward the Temporal port to localhost:7233
+#   make port-forward      Forward the metrics port to localhost:9090
 #   make port-forward-stop Stop a background port-forward tunnel
 #   make provision         Provision an AWS EC2 instance + EBS volume
 #   make provision-destroy Destroy the EC2 instance and associated resources
@@ -102,16 +102,16 @@ build-agent:
 # Run / stop
 # ---------------------------------------------------------------------------
 
-## run: Start the worker in the foreground on the target
-run:
+## run: Start the worker in the foreground on the target (+ metrics tunnel)
+run: port-forward-bg
 	$(SCRIPTS)/vm-run.sh $(_REMOTE_FLAG)
 
 ## run-release: Start the release binary in the foreground
 run-release:
 	$(SCRIPTS)/vm-run.sh $(_REMOTE_FLAG) --release
 
-## run-detach: Start the worker as a background systemd service
-run-detach:
+## run-detach: Start the worker as a background systemd service (+ metrics tunnel)
+run-detach: port-forward-bg
 	$(SCRIPTS)/vm-run.sh $(_REMOTE_FLAG) --detach
 
 ## run-detach-release: Start the release binary as a background systemd service
@@ -166,11 +166,11 @@ shell-root:
 # Port forwarding
 # ---------------------------------------------------------------------------
 
-## port-forward: Forward Temporal port (localhost:7233 <-> target)
+## port-forward: Forward metrics port (localhost:9090 <-> target)
 port-forward:
 	$(SCRIPTS)/vm-port-forward.sh $(_REMOTE_FLAG)
 
-## port-forward-bg: Forward Temporal port in the background
+## port-forward-bg: Forward metrics port in the background
 port-forward-bg:
 	$(SCRIPTS)/vm-port-forward.sh $(_REMOTE_FLAG) --background
 

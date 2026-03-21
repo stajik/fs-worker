@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# vm-port-forward.sh — Forward the Temporal port to localhost
+# vm-port-forward.sh — Forward the worker metrics port to localhost
 #
 # Local mode  (default):  tunnels through the Multipass VM
 # Remote mode (--remote): tunnels through the bare-metal SSH host in .env
@@ -10,7 +10,7 @@
 #   ./scripts/vm-port-forward.sh [--remote] --stop
 #
 #   --remote        Target the SSH bare-metal host defined in .env
-#   --port <n>      Local port to bind (default: 7233)
+#   --port <n>      Local port to bind (default: 9090)
 #   --background    Run the tunnel in the background (PID saved to .vm-tunnel.pid)
 #   --stop          Kill a previously backgrounded tunnel
 # =============================================================================
@@ -24,8 +24,8 @@ source "${SCRIPT_DIR}/lib.sh"
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-REMOTE_TEMPORAL_PORT=7233   # Temporal server port on the target
-LOCAL_PORT=7233
+REMOTE_METRICS_PORT=9090    # Prometheus metrics port on the target
+LOCAL_PORT=9090
 PID_FILE="${SCRIPT_DIR}/.vm-tunnel.pid"
 
 # ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ fi
 # -L  : local port forward
 SSH_OPTS=(
     -N -T
-    -L "${LOCAL_PORT}:localhost:${REMOTE_TEMPORAL_PORT}"
+    -L "${LOCAL_PORT}:localhost:${REMOTE_METRICS_PORT}"
     -o StrictHostKeyChecking=no
     -o UserKnownHostsFile=/dev/null
     -o LogLevel=ERROR
@@ -148,7 +148,7 @@ else
     SSH_CMD=(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${TARGET_IP}")
 fi
 
-log "Tunnel: localhost:${LOCAL_PORT} → ${TARGET_IP}:${REMOTE_TEMPORAL_PORT}"
+log "Tunnel: localhost:${LOCAL_PORT} → ${TARGET_IP}:${REMOTE_METRICS_PORT} (metrics)"
 print_mode_banner
 echo ""
 
@@ -177,17 +177,16 @@ if [[ $BACKGROUND -eq 1 ]]; then
     sleep 2
     if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
         rm -f "$PID_FILE"
-        die "Tunnel process exited immediately. Is the Temporal server running on the target?"
+        die "Tunnel process exited immediately. Is the worker running on the target?"
     fi
 
     ok "Tunnel running in the background (PID ${TUNNEL_PID})."
-    ok "  Local endpoint : localhost:${LOCAL_PORT}"
-    ok "  Remote         : ${TARGET_IP}:${REMOTE_TEMPORAL_PORT}"
+    ok "  Metrics: localhost:${LOCAL_PORT} → ${TARGET_IP}:${REMOTE_METRICS_PORT}"
     ok ""
     ok "  To stop the tunnel:"
     ok "    ./scripts/vm-port-forward.sh --stop"
 else
-    ok "Tunnel active — localhost:${LOCAL_PORT} → ${TARGET_IP}:${REMOTE_TEMPORAL_PORT}"
+    ok "Tunnel active — localhost:${LOCAL_PORT} → ${TARGET_IP}:${REMOTE_METRICS_PORT} (metrics)"
     ok "Press Ctrl-C to close the tunnel."
     echo ""
     "${SSH_CMD[@]}"

@@ -381,18 +381,18 @@ make run-detach     # background via systemd
 make logs           # follow logs
 ```
 
-### Step 7 — Forward the Temporal port
+### Step 7 — Forward the metrics port
 
-If `TEMPORAL_HOST` in `.env` is `localhost`, the scripts automatically set up a reverse
-SSH tunnel (`-R`) so the worker on the remote host can reach the Temporal server running
-on your Mac. This happens transparently when `vm-run.sh` is invoked.
-
-You can also manage the tunnel independently:
+The worker exposes Prometheus metrics on port `9090`. To scrape them locally
+(e.g. for the monitoring stack), forward the port through SSH:
 
 ```sh
-make port-forward-bg   # start tunnel in background
+make port-forward-bg   # start tunnel in background (localhost:9090)
 make port-forward-stop # stop it
 ```
+
+> The reverse tunnel for Temporal (`-R`) is set up automatically by `vm-run.sh`
+> when `TEMPORAL_HOST` in `.env` is `localhost` — no manual forwarding needed.
 
 ### Step 8 — Run smoke tests
 
@@ -484,6 +484,40 @@ make build REMOTE=1
 
 ---
 
+## Monitoring
+
+The worker exposes a Prometheus metrics endpoint on port `9090` (configurable via
+`METRICS_ADDR`). The port-forward script tunnels this alongside the Temporal port
+so you can scrape metrics locally.
+
+### Start the monitoring stack
+
+```sh
+cd monitoring
+docker compose up -d
+```
+
+This starts:
+
+| Service    | URL                        | Credentials   |
+|------------|----------------------------|---------------|
+| Grafana    | http://localhost:3000       | admin / admin |
+| Prometheus | http://localhost:9091       | —             |
+
+### Configure Grafana
+
+1. Open Grafana at http://localhost:3000
+2. Go to **Connections → Data sources → Add data source**
+3. Select **Prometheus**, set URL to `http://prometheus:9090`, click **Save & test**
+4. Create a dashboard or explore metrics like `temporal_activity_execution_latency`
+
+### Stop the monitoring stack
+
+```sh
+cd monitoring
+docker compose down
+```
+
 ## Scripts reference
 
 Every script except `vm-provision.sh` and `vm-ssh-allow.sh` accepts `--remote` to
@@ -500,5 +534,5 @@ set in `.env` remote mode is selected automatically.
 | `scripts/vm-stop.sh` | Stop the worker and optionally the VM / pool |
 | `scripts/vm-logs.sh` | Tail fs-worker logs from journald or stdout |
 | `scripts/vm-shell.sh` | Open an interactive shell on the target |
-| `scripts/vm-port-forward.sh` | SSH tunnel `localhost:7233` ↔ target |
+| `scripts/vm-port-forward.sh` | SSH tunnel `localhost:9090` (metrics) ↔ target |
 | `scripts/vm-test.sh` | Smoke tests: server health + task queue registration |

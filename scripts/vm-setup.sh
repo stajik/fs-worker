@@ -312,6 +312,7 @@ if [[ "${MODE}" == "remote" ]]; then
         # Set pool mountpoint to a directory the worker user can write to
         mkdir -p '/mnt/${POOL_NAME}'
         zfs set mountpoint='/mnt/${POOL_NAME}' '${POOL_NAME}'
+        zfs set compression=lz4 '${POOL_NAME}'
         chown '${WORKER_USER}:${WORKER_USER}' '/mnt/${POOL_NAME}'
         echo 'Pool mountpoint set to /mnt/${POOL_NAME}.'
     "
@@ -378,6 +379,7 @@ else
         # Set pool mountpoint to a directory the worker user can write to
         mkdir -p '/mnt/${POOL_NAME}'
         zfs set mountpoint='/mnt/${POOL_NAME}' '${POOL_NAME}'
+        zfs set compression=lz4 '${POOL_NAME}'
         chown '${WORKER_USER}:${WORKER_USER}' '/mnt/${POOL_NAME}'
         echo 'Pool mountpoint set to /mnt/${POOL_NAME}.'
     "
