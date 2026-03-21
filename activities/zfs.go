@@ -100,7 +100,7 @@ func mountDataset(dataset string) error {
 }
 
 func cloneSnapshot(snapshot, target string) error {
-	_, err := runZFS("clone", "-o", "refreservation=none", snapshot, target)
+	_, err := runZFS("clone", "-o", "refreservation=none", "-o", "compression=lz4", snapshot, target)
 	if err != nil {
 		return fmt.Errorf("zfs clone %q -> %q: %w", snapshot, target, err)
 	}
@@ -125,7 +125,7 @@ func createSnapshot(dataset, snapName string) error {
 }
 
 func createDataset(dataset string) error {
-	_, err := runZFS("create", "-o", "canmount=noauto", dataset)
+	_, err := runZFS("create", "-o", "canmount=noauto", "-o", "compression=lz4", dataset)
 	if err != nil {
 		return fmt.Errorf("zfs create %q: %w", dataset, err)
 	}
