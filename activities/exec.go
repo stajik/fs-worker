@@ -40,11 +40,43 @@ func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOut
 	if input.Cmd == "" {
 		return ExecOutput{}, fmt.Errorf("cmd must not be empty")
 	}
+	if input.TargetSnapshot == "" {
+		return ExecOutput{}, fmt.Errorf("target_snapshot must not be empty")
+	}
+	if input.BaseSnapshot == "" {
+		return ExecOutput{}, fmt.Errorf("base_snapshot must not be empty")
+	}
+
+	dataset := datasetName(a.pool, input.ID)
+
+	// Idempotency: if the target snapshot already exists, the exec already
+	// completed successfully. Ensure the branch is on the target and return.
+	if err := rollbackToSnapshot(dataset, input.TargetSnapshot); err == nil {
+		logger.Info("Exec: target snapshot already exists, skipping execution",
+			"dataset", dataset, "target_snapshot", input.TargetSnapshot)
+		return ExecOutput{}, nil
+	}
+
+	// When base_snapshot is __init, create a new branch first. Otherwise
+	// roll the existing branch back to the requested base snapshot.
+	if input.BaseSnapshot == initSnapshotName {
+		if err := a.InitBranch(ctx, InitBranchInput{
+			ID:   input.ID,
+			Mode: input.Mode,
+		}); err != nil {
+			return ExecOutput{}, fmt.Errorf("init branch %q: %w", input.ID, err)
+		}
+	} else {
+		if err := rollbackToSnapshot(dataset, input.BaseSnapshot); err != nil {
+			return ExecOutput{}, fmt.Errorf("rollback %q to @%s: %w", dataset, input.BaseSnapshot, err)
+		}
+	}
 
 	logger.Info("Exec: starting",
 		"id", input.ID,
 		"mode", input.Mode,
 		"template_id", input.TemplateID,
+		"base_snapshot", input.BaseSnapshot,
 		"use_snapshot", input.UseSnapshot,
 		"cmd", input.Cmd,
 	)
@@ -87,10 +119,13 @@ func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOut
 		// return the partial output as a successful (but timed-out) result
 		// instead of propagating the error.
 		if vmCtx.Err() != nil && ctx.Err() == nil {
-			logger.Warn("Exec: VM timed out, returning partial output",
+			logger.Warn("Exec: VM timed out, rolling back to base snapshot",
 				"id", input.ID,
 				"vm_error", vmErr,
 			)
+			if rbErr := rollbackToSnapshot(dataset, input.BaseSnapshot); rbErr != nil {
+				logger.Error("Exec: rollback after timeout failed", "error", rbErr)
+			}
 			return ExecOutput{
 				ExitCode: -1,
 				Stdout:   stdout,
@@ -98,12 +133,37 @@ func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOut
 				TimedOut: true,
 			}, nil
 		}
+		// Roll back to base on VM error.
+		if rbErr := rollbackToSnapshot(dataset, input.BaseSnapshot); rbErr != nil {
+			logger.Error("Exec: rollback after VM error failed", "error", rbErr)
+		}
 		return ExecOutput{}, fmt.Errorf("run firecracker: %w", vmErr)
+	}
+
+	// Non-zero exit code: rollback to base snapshot.
+	if exitCode != 0 {
+		logger.Info("Exec: command failed, rolling back to base snapshot",
+			"id", input.ID, "exit_code", exitCode)
+		if rbErr := rollbackToSnapshot(dataset, input.BaseSnapshot); rbErr != nil {
+			logger.Error("Exec: rollback after failed command failed", "error", rbErr)
+		}
+		return ExecOutput{
+			ExitCode: exitCode,
+			Stdout:   stdout,
+			Stderr:   stderr,
+		}, nil
+	}
+
+	// Success: create the target snapshot.
+	if err := createSnapshot(dataset, input.TargetSnapshot); err != nil {
+		return ExecOutput{}, fmt.Errorf("create target snapshot @%s for %q: %w",
+			input.TargetSnapshot, dataset, err)
 	}
 
 	logger.Info("Exec: done",
 		"id", input.ID,
 		"exit_code", exitCode,
+		"target_snapshot", input.TargetSnapshot,
 	)
 
 	return ExecOutput{

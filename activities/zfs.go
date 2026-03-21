@@ -107,6 +107,23 @@ func cloneSnapshot(snapshot, target string) error {
 	return nil
 }
 
+func rollbackToSnapshot(dataset string, snap string) error {
+	fullSnap := dataset + "@" + snap
+	_, err := runZFS("rollback", "-r", fullSnap)
+	if err != nil {
+		return fmt.Errorf("zfs rollback %q: %w", snap, err)
+	}
+	return nil
+}
+
+func createSnapshot(dataset, snapName string) error {
+	_, err := runZFS("snapshot", dataset+"@"+snapName)
+	if err != nil {
+		return fmt.Errorf("zfs snapshot %q: %w", dataset+"@"+snapName, err)
+	}
+	return nil
+}
+
 func createDataset(dataset string) error {
 	_, err := runZFS("create", "-o", "canmount=noauto", dataset)
 	if err != nil {

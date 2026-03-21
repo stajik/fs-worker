@@ -25,6 +25,10 @@ func NewFsWorkerActivities(pool string) *FsWorkerActivities {
 // InitBranch creates a new branch as either a ZFS zvol (block device) or a
 // ZFS dataset (filesystem), depending on the requested mode.
 //
+// The activity is idempotent: if the dataset already exists (e.g. from a
+// previous partial run) the remaining setup steps are retried and the branch
+// is rolled back to @__init before returning.
+//
 // For zvol mode the branch is created by cloning the pre-formatted base
 // snapshot (<pool>/_base/vol@empty) that was set up at worker startup.
 //
@@ -47,7 +51,10 @@ func (a *FsWorkerActivities) InitBranch(ctx context.Context, input InitBranchInp
 	case BranchModeZvol:
 		snap := baseSnapshotFull(a.pool)
 		if err := cloneSnapshot(snap, dataset); err != nil {
-			return fmt.Errorf("clone %q -> %q: %w", snap, dataset, err)
+			if !strings.Contains(err.Error(), "already exists") {
+				return fmt.Errorf("clone %q -> %q: %w", snap, dataset, err)
+			}
+			logger.Info("InitBranch: dataset already exists, continuing setup", "dataset", dataset)
 		}
 
 		device := zvolDevicePath(dataset)
@@ -55,12 +62,25 @@ func (a *FsWorkerActivities) InitBranch(ctx context.Context, input InitBranchInp
 			return fmt.Errorf("wait for device %q: %w", device, err)
 		}
 
+		if err := createSnapshot(dataset, initSnapshotName); err != nil {
+			if !strings.Contains(err.Error(), "already exists") {
+				return fmt.Errorf("create @%s snapshot for %q: %w", initSnapshotName, dataset, err)
+			}
+		}
+
+		if err := rollbackToSnapshot(dataset, initSnapshotName); err != nil {
+			return fmt.Errorf("rollback %q to @%s: %w", dataset, initSnapshotName, err)
+		}
+
 		logger.Info("InitBranch: done (zvol)", "dataset", dataset, "device", device)
 		return nil
 
 	case BranchModeZDS:
 		if err := createDataset(dataset); err != nil {
-			return fmt.Errorf("create dataset %q: %w", dataset, err)
+			if !strings.Contains(err.Error(), "already exists") {
+				return fmt.Errorf("create dataset %q: %w", dataset, err)
+			}
+			logger.Info("InitBranch: dataset already exists, continuing setup", "dataset", dataset)
 		}
 
 		// Pre-create the mountpoint directory so sudo zfs mount succeeds.
@@ -78,6 +98,16 @@ func (a *FsWorkerActivities) InitBranch(ctx context.Context, input InitBranchInp
 		dst := filepath.Join(mp, dataImgName)
 		if err := copyFile(baseDataImgPath, dst); err != nil {
 			return fmt.Errorf("copy base data image to %q: %w", dst, err)
+		}
+
+		if err := createSnapshot(dataset, initSnapshotName); err != nil {
+			if !strings.Contains(err.Error(), "already exists") {
+				return fmt.Errorf("create @%s snapshot for %q: %w", initSnapshotName, dataset, err)
+			}
+		}
+
+		if err := rollbackToSnapshot(dataset, initSnapshotName); err != nil {
+			return fmt.Errorf("rollback %q to @%s: %w", dataset, initSnapshotName, err)
 		}
 
 		logger.Info("InitBranch: done (zds)", "dataset", dataset, "mountpoint", mp)

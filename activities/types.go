@@ -15,6 +15,12 @@ const (
 	BranchModeZDS BranchMode = "zds"
 )
 
+const (
+	// initSnapshotName is the name of the initial snapshot created on every
+	// new branch (e.g. <pool>/<id>@__init).
+	initSnapshotName = "__init"
+)
+
 // InitBranchInput is the input payload for the InitBranch activity.
 type InitBranchInput struct {
 	// ID is the unique identifier for the branch. It becomes the dataset name
@@ -41,6 +47,17 @@ type ExecInput struct {
 
 	// Cmd is the command (shell script) to execute inside the Firecracker microVM.
 	Cmd string `json:"cmd"`
+
+	// TargetSnapshot is the snapshot to create after a successful execution.
+	// On failure (non-zero exit code, timeout, or VM error) the branch is
+	// rolled back to BaseSnapshot instead.
+	TargetSnapshot string `json:"target_snapshot"`
+
+	// BaseSnapshot is the snapshot the branch must be on before executing.
+	// If the branch is on a newer snapshot, it will be rolled back. If the
+	// snapshot doesn't exist or is not a valid rollback target, ZFS will error.
+	// When set to "__init", the branch is created first via InitBranch.
+	BaseSnapshot string `json:"base_snapshot"`
 
 	// UseSnapshot, if true, restores the VM from the template snapshot instead
 	// of cold-booting. Useful for benchmarking snapshot vs cold-boot latency.
