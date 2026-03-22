@@ -37,8 +37,14 @@ func main() {
 	log.Printf("  METRICS_ADDR       = %s", metricsAddr)
 
 	// Set up Prometheus metrics reporter.
+	// Buckets in seconds: 1ms, 2ms, 4ms, … up to ~3.6h (21 buckets).
+	histogramBuckets := make([]float64, 21)
+	for i := range histogramBuckets {
+		histogramBuckets[i] = 0.001 * float64(int(1)<<i) // 0.001, 0.002, 0.004, …
+	}
 	tallyReporter := tallyprom.NewReporter(tallyprom.Options{
-		DefaultTimerType: tallyprom.HistogramTimerType,
+		DefaultTimerType:        tallyprom.HistogramTimerType,
+		DefaultHistogramBuckets: histogramBuckets,
 	})
 	tallyScope, scopeCloser := tally.NewRootScope(tally.ScopeOptions{
 		Prefix:         "temporal",

@@ -26,6 +26,12 @@ const (
 // time out, the VM runs under a shortened context that expires vmGracePeriod
 // before the activity deadline.
 func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOutput, error) {
+	t0 := time.Now()
+	metricsHandler := activity.GetMetricsHandler(ctx)
+	defer func() {
+		metricsHandler.Timer(metricExecDuration).Record(time.Since(t0))
+	}()
+
 	logger := activity.GetLogger(ctx)
 
 	if err := validateID(input.ID); err != nil {
@@ -102,11 +108,15 @@ func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOut
 	var stdout, stderr, rawStdout, rawStderr string
 	var exitCode int
 	var vmErr error
+	vmStart := time.Now()
 	if input.UseSnapshot {
 		stdout, stderr, exitCode, rawStdout, rawStderr, vmErr = runFromSnapshot(vmCtx, input.ID, input.TemplateID, drivePath, input.Cmd)
 	} else {
 		stdout, stderr, exitCode, rawStdout, rawStderr, vmErr = runFromTemplate(vmCtx, input.ID, input.TemplateID, drivePath, input.Cmd)
 	}
+	vmDuration := time.Since(vmStart)
+
+	recordVMMetrics(metricsHandler, rawStdout, vmStart, vmDuration)
 
 	logger.Info("Exec: VM raw output",
 		"id", input.ID,

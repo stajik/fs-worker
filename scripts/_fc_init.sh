@@ -19,6 +19,10 @@
 #   Boot args example:
 #     init=/_fc_init.sh fc_nodata=1
 
+# Capture boot start time as early as possible (Unix epoch milliseconds).
+BOOT_T0=$(date +%s%3N)
+echo "===FC_BOOT_T0=$BOOT_T0==="
+
 # Minimal early mounts (ignore already-mounted errors).
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
@@ -86,6 +90,10 @@ echo "[fc_init] CMD=[$(echo "$CMD" | head -c 200)]"
 if mountpoint -q /data 2>/dev/null; then
     cd /data
 fi
+
+BOOT_T1=$(date +%s%3N)
+BOOT_ELAPSED=$((BOOT_T1 - BOOT_T0))
+echo "===FC_BOOT_TIME=$BOOT_ELAPSED==="
 
 echo "[fc_init] executing command"
 T0=$(date +%s%3N)

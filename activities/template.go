@@ -19,7 +19,19 @@ import (
 //  2. Boots a new VM from the squashfs, pauses it, and takes a snapshot.
 //
 // All artifacts are stored under /opt/firecracker/templates/<id>/.
+const (
+	metricCreateTemplateDuration   = "fs_create_template_duration"
+	metricTemplateSquashfsDuration = "fs_template_squashfs_duration"
+	metricTemplateSnapshotDuration = "fs_template_snapshot_duration"
+)
+
 func (a *FsWorkerActivities) CreateTemplate(ctx context.Context, input CreateTemplateInput) (CreateTemplateOutput, error) {
+	t0 := time.Now()
+	metricsHandler := activity.GetMetricsHandler(ctx)
+	defer func() {
+		metricsHandler.Timer(metricCreateTemplateDuration).Record(time.Since(t0))
+	}()
+
 	logger := activity.GetLogger(ctx)
 
 	if err := validateID(input.ID); err != nil {
@@ -67,16 +79,19 @@ func (a *FsWorkerActivities) CreateTemplate(ctx context.Context, input CreateTem
 		}
 	}
 
+	vmStart := time.Now()
 	vm, err := startFirecracker(vmCtx, "tpl-"+input.ID, cfg, "")
 	if err != nil {
 		return CreateTemplateOutput{}, fmt.Errorf("start firecracker: %w", err)
 	}
 
 	waitErr := vm.machine.Wait(vmCtx)
+	rawStdout, rawStderr := vm.rawOutput()
+	vmDuration := time.Since(vmStart)
+	recordVMMetrics(metricsHandler, rawStdout, vmStart, vmDuration)
 
 	stdout, stderr, exitCode := vm.output()
 	if exitCode == -1 {
-		rawStdout, rawStderr := vm.rawOutput()
 		logger.Warn("CreateTemplate: markers not found in VM output",
 			"id", input.ID,
 			"raw_stdout", rawStdout,
@@ -111,9 +126,11 @@ func (a *FsWorkerActivities) CreateTemplate(ctx context.Context, input CreateTem
 	// -----------------------------------------------------------------
 
 	squashfsPath := filepath.Join(tplDir, "rootfs.squashfs")
+	squashfsStart := time.Now()
 	if err := ext4ToSquashfs(rootfsCopy, squashfsPath); err != nil {
 		return CreateTemplateOutput{}, fmt.Errorf("convert to squashfs: %w", err)
 	}
+	metricsHandler.Timer(metricTemplateSquashfsDuration).Record(time.Since(squashfsStart))
 
 	logger.Info("CreateTemplate: squashfs ready, booting snapshot VM", "id", input.ID)
 
@@ -133,6 +150,7 @@ func (a *FsWorkerActivities) CreateTemplate(ctx context.Context, input CreateTem
 	snapVsockUDS := vsockUDSPath("tpl-snap-" + input.ID)
 	defer os.Remove(snapVsockUDS)
 
+	snapStart := time.Now()
 	snapCfg := buildSnapshotCaptureConfig(snapSocketPath, squashfsPath, snapVsockUDS)
 	snapVM, err := startFirecracker(ctx, "tpl-snap-"+input.ID, snapCfg, "===FC_READY===")
 	if err != nil {
@@ -177,6 +195,8 @@ func (a *FsWorkerActivities) CreateTemplate(ctx context.Context, input CreateTem
 		_ = snapVM.machine.StopVMM()
 		return CreateTemplateOutput{}, ctx.Err()
 	}
+
+	metricsHandler.Timer(metricTemplateSnapshotDuration).Record(time.Since(snapStart))
 
 	// Clean up the intermediate ext4 copy.
 	os.Remove(rootfsCopy)

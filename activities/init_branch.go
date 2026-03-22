@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"go.temporal.io/sdk/activity"
 )
@@ -34,6 +35,11 @@ func NewFsWorkerActivities(pool string) *FsWorkerActivities {
 //
 // For zds mode a plain ZFS filesystem dataset is created.
 func (a *FsWorkerActivities) InitBranch(ctx context.Context, input InitBranchInput) error {
+	t0 := time.Now()
+	defer func() {
+		activity.GetMetricsHandler(ctx).Timer(metricInitBranchDuration).Record(time.Since(t0))
+	}()
+
 	logger := activity.GetLogger(ctx)
 
 	if err := validateID(input.ID); err != nil {
