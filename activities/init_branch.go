@@ -36,8 +36,9 @@ func NewFsWorkerActivities(pool string) *FsWorkerActivities {
 // For zds mode a plain ZFS filesystem dataset is created.
 func (a *FsWorkerActivities) InitBranch(ctx context.Context, input InitBranchInput) error {
 	t0 := time.Now()
+	metricsHandler := activity.GetMetricsHandler(ctx).WithTags(map[string]string{"mode": string(input.Mode)})
 	defer func() {
-		activity.GetMetricsHandler(ctx).Timer(metricInitBranchDuration).Record(time.Since(t0))
+		metricsHandler.Timer(metricInitBranchDuration).Record(time.Since(t0))
 	}()
 
 	logger := activity.GetLogger(ctx)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 
@@ -10,6 +11,7 @@ import (
 	tallyprom "github.com/uber-go/tally/v4/prometheus"
 	"go.temporal.io/sdk/client"
 	sdktally "go.temporal.io/sdk/contrib/tally"
+	temporallog "go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/worker"
 
 	"github.com/filesystem/fs-worker/activities"
@@ -63,17 +65,25 @@ func main() {
 		}
 	}()
 
+	// Temporal SDK logger at INFO level (default is DEBUG).
+	sdkLogger := temporallog.NewStructuredLogger(
+		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	)
+
 	c, err := client.Dial(client.Options{
 		HostPort:       temporalHost,
 		Namespace:      temporalNamespace,
 		MetricsHandler: metricsHandler,
+		Logger:         sdkLogger,
 	})
 	if err != nil {
 		log.Fatalf("failed to create Temporal client: %v", err)
 	}
 	defer c.Close()
 
-	w := worker.New(c, taskQueue, worker.Options{})
+	w := worker.New(c, taskQueue, worker.Options{
+		MaxConcurrentActivityTaskPollers: 50,
+	})
 
 	acts := activities.NewFsWorkerActivities(zfsPool)
 	w.RegisterActivity(acts)

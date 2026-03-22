@@ -111,5 +111,10 @@ echo "===FC_STDERR_END==="
 echo "===FC_EXIT_CODE=$RC==="
 echo "===FC_TIME=$ELAPSED==="
 
+SYNC_T0=$(date +%s%3N)
 sync
+SYNC_T1=$(date +%s%3N)
+SYNC_ELAPSED=$((SYNC_T1 - SYNC_T0))
+echo "===FC_SYNC_TIME=$SYNC_ELAPSED==="
+
 reboot -f

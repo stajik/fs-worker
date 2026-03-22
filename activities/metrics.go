@@ -14,13 +14,17 @@ const (
 	metricVMKernelBoot       = "fs_vm_kernel_boot_duration"
 	metricVMGuestInit        = "fs_vm_guest_init_duration"
 	metricCmdDuration        = "fs_cmd_duration"
+	metricVMSyncDuration     = "fs_vm_sync_duration"
+	metricVMTotalDuration    = "fs_vm_total_duration"
 	metricVMShutdownDuration = "fs_vm_shutdown_duration"
+	metricSnapshotDuration   = "fs_snapshot_duration"
 )
 
 var (
 	reBootT0   = regexp.MustCompile(`===FC_BOOT_T0=(\d+)===`)
 	reBootTime = regexp.MustCompile(`===FC_BOOT_TIME=(\d+)===`)
 	reCmdTime  = regexp.MustCompile(`===FC_TIME=(\d+)===`)
+	reSyncTime = regexp.MustCompile(`===FC_SYNC_TIME=(\d+)===`)
 )
 
 // recordVMMetrics parses timing markers from the raw VM stdout and records
@@ -37,7 +41,9 @@ var (
 // totalVMDuration is the host-side wall clock time from vmStart to
 // machine.Wait returning.
 func recordVMMetrics(handler client.MetricsHandler, rawStdout string, vmStart time.Time, totalVMDuration time.Duration) {
-	var kernelMs, initMs, cmdMs float64
+	handler.Timer(metricVMTotalDuration).Record(totalVMDuration)
+
+	var kernelMs, initMs, cmdMs, syncMs float64
 
 	// Kernel boot: host vmStart → guest BOOT_T0.
 	if m := reBootT0.FindStringSubmatch(rawStdout); len(m) == 2 {
@@ -66,9 +72,17 @@ func recordVMMetrics(handler client.MetricsHandler, rawStdout string, vmStart ti
 		}
 	}
 
-	// Shutdown: total - kernel_boot - guest_init - cmd.
-	if kernelMs > 0 || initMs > 0 || cmdMs > 0 {
-		shutdownMs := float64(totalVMDuration.Milliseconds()) - kernelMs - initMs - cmdMs
+	// Sync (fsync at end of _fc_init.sh).
+	if m := reSyncTime.FindStringSubmatch(rawStdout); len(m) == 2 {
+		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+			syncMs = v
+			handler.Timer(metricVMSyncDuration).Record(time.Duration(v) * time.Millisecond)
+		}
+	}
+
+	// Shutdown: total - kernel_boot - guest_init - cmd - sync.
+	if kernelMs > 0 || initMs > 0 || cmdMs > 0 || syncMs > 0 {
+		shutdownMs := float64(totalVMDuration.Milliseconds()) - kernelMs - initMs - cmdMs - syncMs
 		if shutdownMs >= 0 {
 			handler.Timer(metricVMShutdownDuration).Record(time.Duration(shutdownMs) * time.Millisecond)
 		}

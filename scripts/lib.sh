@@ -311,7 +311,7 @@ remote_copy() {
             printf ' "$@"\n'
         } > "${_ssh_wrapper}"
 
-        rsync -az \
+        rsync -az --delete \
             -e "${_ssh_wrapper}" \
             --rsync-path='sudo rsync' \
             "${src}" \

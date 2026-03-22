@@ -27,7 +27,7 @@ const (
 // before the activity deadline.
 func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOutput, error) {
 	t0 := time.Now()
-	metricsHandler := activity.GetMetricsHandler(ctx)
+	metricsHandler := activity.GetMetricsHandler(ctx).WithTags(map[string]string{"mode": string(input.Mode)})
 	defer func() {
 		metricsHandler.Timer(metricExecDuration).Record(time.Since(t0))
 	}()
@@ -118,7 +118,7 @@ func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOut
 
 	recordVMMetrics(metricsHandler, rawStdout, vmStart, vmDuration)
 
-	logger.Info("Exec: VM raw output",
+	logger.Debug("Exec: VM raw output",
 		"id", input.ID,
 		"raw_stdout", rawStdout,
 		"raw_stderr", rawStderr,
@@ -165,10 +165,12 @@ func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOut
 	}
 
 	// Success: create the target snapshot.
+	snapStart := time.Now()
 	if err := createSnapshot(dataset, input.TargetSnapshot); err != nil {
 		return ExecOutput{}, fmt.Errorf("create target snapshot @%s for %q: %w",
 			input.TargetSnapshot, dataset, err)
 	}
+	metricsHandler.Timer(metricSnapshotDuration).Record(time.Since(snapStart))
 
 	logger.Info("Exec: done",
 		"id", input.ID,

@@ -27,7 +27,7 @@ const (
 
 func (a *FsWorkerActivities) CreateTemplate(ctx context.Context, input CreateTemplateInput) (CreateTemplateOutput, error) {
 	t0 := time.Now()
-	metricsHandler := activity.GetMetricsHandler(ctx)
+	metricsHandler := activity.GetMetricsHandler(ctx).WithTags(map[string]string{"mode": "template"})
 	defer func() {
 		metricsHandler.Timer(metricCreateTemplateDuration).Record(time.Since(t0))
 	}()
