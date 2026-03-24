@@ -4,14 +4,22 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+)
+
+const (
+	// maxPrefetchConcurrency is the maximum number of S3 downloads that
+	// can run in parallel during branch reconstruction.
+	maxPrefetchConcurrency = 4
 )
 
 // countingReader wraps an io.Reader and counts the total bytes read through
@@ -56,14 +64,20 @@ func newS3Client(ctx context.Context, region string) (*s3.Client, error) {
 	return s3.NewFromConfig(cfg), nil
 }
 
-// uploadSnapshotDiff streams an incremental ZFS diff between baseSnap and
-// targetSnap to S3. The object key is "<branchID>/<targetSnapName>".
+// uploadSnapshotDiff streams a ZFS diff to S3. The object key is
+// "<branchID>/<targetSnapName>".
 //
-// It runs:
+// When baseSnap is __init, it sends a full stream so that reconstruction
+// can apply it over a freshly initialised branch (whose __init won't match
+// the original):
+//
+//	zfs send <dataset>@<targetSnap>
+//
+// Otherwise it sends an incremental stream:
 //
 //	zfs send -i <dataset>@<baseSnap> <dataset>@<targetSnap>
 //
-// and pipes stdout directly into an S3 multipart upload so the diff never
+// Stdout is piped directly into an S3 multipart upload so the diff never
 // needs to be materialized on disk. The manager.Uploader handles chunking
 // the stream automatically, which avoids the Content-Length requirement
 // that a plain PutObject imposes on unseekable readers.
@@ -84,11 +98,17 @@ func (a *FsWorkerActivities) uploadSnapshotDiff(ctx context.Context, dataset, br
 		return 0, err
 	}
 
-	baseRef := dataset + "@" + baseSnap
 	targetRef := dataset + "@" + targetSnap
 
-	// zfs send -i <base> <target> produces an incremental stream.
-	cmd := exec.CommandContext(ctx, "zfs", "send", "-i", baseRef, targetRef)
+	// When the base is __init, send a full stream that includes __init and
+	// the target snapshot. Otherwise send an incremental stream.
+	var cmd *exec.Cmd
+	if baseSnap == initSnapshotName {
+		cmd = exec.CommandContext(ctx, "zfs", "send", "-w", targetRef)
+	} else {
+		baseRef := dataset + "@" + baseSnap
+		cmd = exec.CommandContext(ctx, "zfs", "send", "-w", "-i", baseRef, targetRef)
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -123,11 +143,245 @@ func (a *FsWorkerActivities) uploadSnapshotDiff(ctx context.Context, dataset, br
 		return cr.BytesRead(), fmt.Errorf("s3 upload %q: %w", key, uploadErr)
 	}
 	if cmdErr != nil {
-		return cr.BytesRead(), fmt.Errorf("zfs send -i %s %s: %s: %w", baseRef, targetRef, stderrBuf.String(), cmdErr)
+		return cr.BytesRead(), fmt.Errorf("zfs send %s: %s: %w", targetRef, stderrBuf.String(), cmdErr)
 	}
 
 	return cr.BytesRead(), nil
 }
+
+// ---------------------------------------------------------------------------
+// Download / Reconstruction
+// ---------------------------------------------------------------------------
+
+// downloadSnapshotDiff downloads an incremental ZFS diff from S3 and applies
+// it to the dataset via `zfs receive -F`. The object key is
+// "<branchID>/<snapName>".
+//
+// The -F flag forces a rollback of the dataset to the most recent snapshot
+// before applying the incremental stream, which is required for `zfs receive`
+// to accept it.
+//
+// Returns the number of bytes downloaded.
+func (a *FsWorkerActivities) downloadSnapshotDiff(ctx context.Context, dataset, branchID, snapName string) (int64, error) {
+	if a.s3Bucket == "" {
+		return 0, fmt.Errorf("s3 bucket not configured — cannot download snapshot diff")
+	}
+
+	client, err := a.getS3Client(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	key := branchID + "/" + snapName
+
+	getOut, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(a.s3Bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("s3 get %q: %w", key, err)
+	}
+	defer getOut.Body.Close()
+
+	cr := newCountingReader(getOut.Body)
+
+	// zfs receive <dataset> applies the stream.
+	cmd := exec.CommandContext(ctx, "zfs", "receive", dataset)
+	cmd.Stdin = cr
+
+	var stderrBuf strings.Builder
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Run(); err != nil {
+		return cr.BytesRead(), fmt.Errorf("zfs receive -F %s (from s3://%s/%s): %s: %w",
+			dataset, a.s3Bucket, key, stderrBuf.String(), err)
+	}
+
+	return cr.BytesRead(), nil
+}
+
+// prefetchedDiff holds a snapshot diff that was downloaded from S3 to a local
+// temporary file. The file is ready to be piped into `zfs receive`.
+type prefetchedDiff struct {
+	SnapName string        // snapshot name
+	Path     string        // path to the temp file
+	Size     int64         // bytes downloaded
+	Duration time.Duration // wall-clock time for this download
+	Err      error         // non-nil if the download failed
+	ready    chan struct{} // closed when this slot's download is done
+}
+
+// downloadToFile downloads a single snapshot diff from S3 into a temporary
+// file on disk. Returns the temp file path and the number of bytes written.
+func (a *FsWorkerActivities) downloadToFile(ctx context.Context, branchID, snapName string) (path string, size int64, err error) {
+	client, err := a.getS3Client(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+
+	key := branchID + "/" + snapName
+
+	getOut, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(a.s3Bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return "", 0, fmt.Errorf("s3 get %q: %w", key, err)
+	}
+	defer getOut.Body.Close()
+
+	f, err := os.CreateTemp("", "zfs-diff-*.stream")
+	if err != nil {
+		return "", 0, fmt.Errorf("create temp file: %w", err)
+	}
+
+	n, copyErr := io.Copy(f, getOut.Body)
+	// Close the file regardless — we'll reopen it for zfs receive.
+	closeErr := f.Close()
+
+	if copyErr != nil {
+		os.Remove(f.Name())
+		return "", 0, fmt.Errorf("download s3://%s/%s: %w", a.s3Bucket, key, copyErr)
+	}
+	if closeErr != nil {
+		os.Remove(f.Name())
+		return "", 0, fmt.Errorf("close temp file: %w", closeErr)
+	}
+
+	return f.Name(), n, nil
+}
+
+// applyDiffFromFile pipes a local file into `zfs receive -F <dataset>`.
+func applyDiffFromFile(ctx context.Context, dataset, filePath string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open diff file %q: %w", filePath, err)
+	}
+	defer f.Close()
+
+	cmd := exec.CommandContext(ctx, "zfs", "receive", dataset)
+	cmd.Stdin = f
+
+	var stderrBuf strings.Builder
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("zfs receive -F %s (from %s): %s: %w",
+			dataset, filePath, stderrBuf.String(), err)
+	}
+
+	return nil
+}
+
+// prefetchSnapshotDiffs downloads snapshot diffs from S3 concurrently (up to
+// maxPrefetchConcurrency) while applying them sequentially as soon as each
+// blob becomes available. This pipelines network I/O (S3 → temp file) with
+// disk I/O (temp file → zfs receive) so the applier never waits for blobs
+// that aren't needed yet.
+//
+// Each slot has a `ready` channel that is closed when the download finishes.
+// The applier iterates in order, blocking on each slot's channel, so diffs
+// are always applied in the correct chronological sequence regardless of
+// which downloads finish first.
+//
+// Per-blob fs_s3_download_duration and fs_s3_download_bytes metrics are
+// recorded for each successfully downloaded diff via the provided callbacks.
+//
+// Returns the total bytes downloaded across all diffs.
+//
+// Temporary files are cleaned up after each successful apply, or all at once
+// if an error occurs.
+func (a *FsWorkerActivities) prefetchSnapshotDiffs(ctx context.Context, dataset, branchID string, snapshots []string, downloadDurationRecorder func(time.Duration), downloadBytesRecorder func(float64)) (int64, error) {
+	if len(snapshots) == 0 {
+		return 0, nil
+	}
+
+	// Initialise per-slot results with a ready channel each.
+	slots := make([]prefetchedDiff, len(snapshots))
+	for i, snap := range snapshots {
+		slots[i] = prefetchedDiff{
+			SnapName: snap,
+			ready:    make(chan struct{}),
+		}
+	}
+
+	// Launch downloaders — up to maxPrefetchConcurrency at a time.
+	sem := make(chan struct{}, maxPrefetchConcurrency)
+	for i := range snapshots {
+		go func(idx int) {
+			defer close(slots[idx].ready)
+
+			// Acquire semaphore slot.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				slots[idx].Err = ctx.Err()
+				return
+			}
+			defer func() { <-sem }()
+
+			dlStart := time.Now()
+			path, size, err := a.downloadToFile(ctx, branchID, snapshots[idx])
+			slots[idx].Path = path
+			slots[idx].Size = size
+			slots[idx].Duration = time.Since(dlStart)
+			slots[idx].Err = err
+		}(i)
+	}
+
+	// cleanupFrom removes temp files from index `from` onward, waiting for
+	// each slot's download to finish first so we don't race on the Path field.
+	cleanupFrom := func(from int) {
+		for j := from; j < len(slots); j++ {
+			<-slots[j].ready
+			if slots[j].Path != "" {
+				os.Remove(slots[j].Path)
+				slots[j].Path = ""
+			}
+		}
+	}
+
+	// Apply diffs sequentially in order, blocking on each slot's ready
+	// channel so we start applying as soon as the next blob is available.
+	var totalBytes int64
+	for i := range slots {
+		// Wait for this slot's download to complete.
+		select {
+		case <-slots[i].ready:
+		case <-ctx.Done():
+			cleanupFrom(i)
+			return totalBytes, ctx.Err()
+		}
+
+		if slots[i].Err != nil {
+			cleanupFrom(i)
+			return totalBytes, fmt.Errorf("download snapshot %q: %w", slots[i].SnapName, slots[i].Err)
+		}
+
+		// Record per-blob metrics now that the download succeeded.
+		downloadDurationRecorder(slots[i].Duration)
+		downloadBytesRecorder(float64(slots[i].Size))
+
+		if err := applyDiffFromFile(ctx, dataset, slots[i].Path); err != nil {
+			// Clean up this file and all remaining.
+			os.Remove(slots[i].Path)
+			slots[i].Path = ""
+			cleanupFrom(i + 1)
+			return totalBytes, fmt.Errorf("apply snapshot %q: %w", slots[i].SnapName, err)
+		}
+
+		totalBytes += slots[i].Size
+		// Clean up the temp file immediately after successful apply.
+		os.Remove(slots[i].Path)
+		slots[i].Path = ""
+	}
+
+	return totalBytes, nil
+}
+
+// ---------------------------------------------------------------------------
+// S3 client lifecycle
+// ---------------------------------------------------------------------------
 
 // getS3Client returns a cached S3 client, creating one on first use.
 func (a *FsWorkerActivities) getS3Client(ctx context.Context) (*s3.Client, error) {

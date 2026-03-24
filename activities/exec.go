@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
 )
 
 const (
@@ -74,7 +75,28 @@ func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOut
 		}
 	} else {
 		if err := rollbackToSnapshot(dataset, input.BaseSnapshot); err != nil {
-			return ExecOutput{}, fmt.Errorf("rollback %q to @%s: %w", dataset, input.BaseSnapshot, err)
+			if input.Reconstruct == nil {
+				return ExecOutput{}, fmt.Errorf("rollback %q to @%s: %w", dataset, input.BaseSnapshot, err)
+			}
+			logger.Info("Exec: rollback failed, attempting reconstruction from S3",
+				"id", input.ID,
+				"base_snapshot", input.BaseSnapshot,
+				"snapshots", input.Reconstruct.Snapshots,
+				"rollback_error", err,
+			)
+			if err := a.reconstructBranch(ctx, input, metricsHandler); err != nil {
+				return ExecOutput{}, fmt.Errorf("reconstruct branch %q: %w", input.ID, err)
+			}
+			switch input.Mode {
+			case BranchModeZvol:
+				if err := waitForDevice(ctx, zvolDevicePath(dataset)); err != nil {
+					return ExecOutput{}, fmt.Errorf("wait for zvol device after reconstruction: %w", err)
+				}
+			case BranchModeZDS:
+				if err := mountDataset(dataset); err != nil {
+					return ExecOutput{}, fmt.Errorf("mount dataset after reconstruction: %w", err)
+				}
+			}
 		}
 	}
 
@@ -172,28 +194,25 @@ func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOut
 	}
 	metricsHandler.Timer(metricSnapshotDuration).Record(time.Since(snapStart))
 
-	// Upload incremental diff to S3 (skip when base is __init — there is no
-	// meaningful prior snapshot to diff against).
-	if input.BaseSnapshot != initSnapshotName {
-		uploadStart := time.Now()
-		uploadBytes, err := a.uploadSnapshotDiff(ctx, dataset, input.ID, input.BaseSnapshot, input.TargetSnapshot)
-		if err != nil {
-			logger.Error("Exec: failed to upload snapshot diff to S3",
-				"id", input.ID,
-				"base_snapshot", input.BaseSnapshot,
-				"target_snapshot", input.TargetSnapshot,
-				"error", err,
-			)
-			return ExecOutput{}, fmt.Errorf("upload snapshot diff to S3: %w", err)
-		}
-		metricsHandler.Timer(metricS3UploadDuration).Record(time.Since(uploadStart))
-		a.s3UploadBytesHist.Observe(float64(uploadBytes))
-		logger.Info("Exec: uploaded snapshot diff to S3",
+	// Upload incremental diff to S3 (including __init → first snapshot).
+	uploadStart := time.Now()
+	uploadBytes, err := a.uploadSnapshotDiff(ctx, dataset, input.ID, input.BaseSnapshot, input.TargetSnapshot)
+	if err != nil {
+		logger.Error("Exec: failed to upload snapshot diff to S3",
 			"id", input.ID,
-			"key", input.ID+"/"+input.TargetSnapshot,
-			"bytes", uploadBytes,
+			"base_snapshot", input.BaseSnapshot,
+			"target_snapshot", input.TargetSnapshot,
+			"error", err,
 		)
+		return ExecOutput{}, fmt.Errorf("upload snapshot diff to S3: %w", err)
 	}
+	metricsHandler.Timer(metricS3UploadDuration).Record(time.Since(uploadStart))
+	a.s3UploadBytesHist.Observe(float64(uploadBytes))
+	logger.Info("Exec: uploaded snapshot diff to S3",
+		"id", input.ID,
+		"key", input.ID+"/"+input.TargetSnapshot,
+		"bytes", uploadBytes,
+	)
 
 	logger.Info("Exec: done",
 		"id", input.ID,
@@ -206,4 +225,80 @@ func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOut
 		Stdout:   stdout,
 		Stderr:   stderr,
 	}, nil
+}
+
+// reconstructBranch rebuilds a branch from scratch using diffs stored in S3.
+// It creates the branch (via InitBranch), then prefetches the incremental
+// diffs in parallel (up to maxPrefetchConcurrency) and applies them
+// sequentially via `zfs receive`.
+//
+// Metrics recorded:
+//   - fs_s3_download_duration  — per-blob download latency
+//   - fs_s3_download_bytes     — per-blob size histogram
+//   - fs_reconstruction_duration — total wall-clock time for the full rebuild
+func (a *FsWorkerActivities) reconstructBranch(ctx context.Context, input ExecInput, metricsHandler client.MetricsHandler) error {
+	reconstructStart := time.Now()
+	logger := activity.GetLogger(ctx)
+	dataset := datasetName(a.pool, input.ID)
+
+	// Step 1: Destroy any existing branch, then create a fresh one without
+	// the @__init snapshot so that the first blob (a full ZFS stream) can
+	// be received cleanly.
+	if err := destroyDataset(dataset); err != nil {
+		return fmt.Errorf("destroy existing branch %q before reconstruction: %w", dataset, err)
+	}
+	if err := a.InitBranch(ctx, InitBranchInput{
+		ID:               input.ID,
+		Mode:             input.Mode,
+		SkipInitSnapshot: true,
+	}); err != nil {
+		return fmt.Errorf("init branch: %w", err)
+	}
+
+	// Step 2: Determine which snapshots to reconstruct.
+	// Collect all snapshots up to and including the base snapshot.
+	var toFetch []string
+	for _, snap := range input.Reconstruct.Snapshots {
+		toFetch = append(toFetch, snap)
+		if snap == input.BaseSnapshot {
+			break
+		}
+	}
+
+	if len(toFetch) == 0 {
+		logger.Info("Exec: reconstruction — no diffs to fetch",
+			"id", input.ID,
+			"base_snapshot", input.BaseSnapshot,
+		)
+		metricsHandler.Timer(metricReconstructionDuration).Record(time.Since(reconstructStart))
+		return nil
+	}
+
+	logger.Info("Exec: reconstructing — prefetching diffs from S3",
+		"id", input.ID,
+		"snapshots", toFetch,
+		"count", len(toFetch),
+	)
+
+	// Step 3: Prefetch all diffs in parallel, then apply sequentially.
+	// Per-blob download metrics are recorded inside prefetchSnapshotDiffs
+	// via these callbacks.
+	totalBytes, err := a.prefetchSnapshotDiffs(ctx, dataset, input.ID, toFetch,
+		func(d time.Duration) { metricsHandler.Timer(metricS3DownloadDuration).Record(d) },
+		func(b float64) { a.s3DownloadBytesHist.Observe(b) },
+	)
+
+	if err != nil {
+		return fmt.Errorf("prefetch and apply diffs: %w", err)
+	}
+
+	logger.Info("Exec: reconstruction complete",
+		"id", input.ID,
+		"base_snapshot", input.BaseSnapshot,
+		"diffs_applied", len(toFetch),
+		"total_bytes", totalBytes,
+	)
+
+	metricsHandler.Timer(metricReconstructionDuration).Record(time.Since(reconstructStart))
+	return nil
 }

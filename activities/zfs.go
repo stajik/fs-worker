@@ -124,6 +124,17 @@ func createSnapshot(dataset, snapName string) error {
 	return nil
 }
 
+func destroyDataset(dataset string) error {
+	_, err := runZFS("destroy", "-r", dataset)
+	if err != nil {
+		if strings.Contains(err.Error(), "does not exist") || strings.Contains(err.Error(), "could not find") {
+			return nil
+		}
+		return fmt.Errorf("zfs destroy -r %q: %w", dataset, err)
+	}
+	return nil
+}
+
 func createDataset(dataset string) error {
 	_, err := runZFS("create", "-o", "canmount=noauto", dataset)
 	if err != nil {

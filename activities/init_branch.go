@@ -17,11 +17,12 @@ import (
 
 // FsWorkerActivities holds shared state for the activity worker.
 type FsWorkerActivities struct {
-	pool              string
-	s3Bucket          string
-	s3Region          string
-	s3Client          *s3.Client
-	s3UploadBytesHist prometheus.Observer
+	pool                string
+	s3Bucket            string
+	s3Region            string
+	s3Client            *s3.Client
+	s3UploadBytesHist   prometheus.Observer
+	s3DownloadBytesHist prometheus.Observer
 }
 
 // s3UploadBytesHistogram is a Prometheus histogram registered once at
@@ -46,14 +47,33 @@ var s3UploadBytesHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
 	},
 })
 
+var s3DownloadBytesHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name: "temporal_" + metricS3DownloadBytes,
+	Help: "Size of ZFS snapshot diffs downloaded from S3 in bytes.",
+	Buckets: []float64{
+		1024,               // 1 KB
+		4 * 1024,           // 4 KB
+		16 * 1024,          // 16 KB
+		64 * 1024,          // 64 KB
+		256 * 1024,         // 256 KB
+		1024 * 1024,        // 1 MB
+		4 * 1024 * 1024,    // 4 MB
+		16 * 1024 * 1024,   // 16 MB
+		64 * 1024 * 1024,   // 64 MB
+		256 * 1024 * 1024,  // 256 MB
+		1024 * 1024 * 1024, // 1 GB
+	},
+})
+
 // NewFsWorkerActivities returns a ready-to-use FsWorkerActivities for the
 // given ZFS pool.
 func NewFsWorkerActivities(pool, s3Bucket, s3Region string) *FsWorkerActivities {
 	return &FsWorkerActivities{
-		pool:              pool,
-		s3Bucket:          s3Bucket,
-		s3Region:          s3Region,
-		s3UploadBytesHist: s3UploadBytesHistogram,
+		pool:                pool,
+		s3Bucket:            s3Bucket,
+		s3Region:            s3Region,
+		s3UploadBytesHist:   s3UploadBytesHistogram,
+		s3DownloadBytesHist: s3DownloadBytesHistogram,
 	}
 }
 
@@ -90,6 +110,13 @@ func (a *FsWorkerActivities) InitBranch(ctx context.Context, input InitBranchInp
 
 	switch input.Mode {
 	case BranchModeZvol:
+		if input.SkipInitSnapshot {
+			// Reconstruction: skip dataset creation entirely — the full
+			// ZFS stream from S3 will create the dataset.
+			logger.Info("InitBranch: skipping dataset creation for reconstruction (zvol)", "dataset", dataset)
+			return nil
+		}
+
 		snap := baseSnapshotFull(a.pool)
 		if err := cloneSnapshot(snap, dataset); err != nil {
 			if !strings.Contains(err.Error(), "already exists") {
@@ -117,6 +144,17 @@ func (a *FsWorkerActivities) InitBranch(ctx context.Context, input InitBranchInp
 		return nil
 
 	case BranchModeZDS:
+		if input.SkipInitSnapshot {
+			// Reconstruction: only ensure the mountpoint directory exists.
+			// The full ZFS stream from S3 will create the dataset.
+			mp := datasetMountPoint(a.pool, input.ID)
+			if err := os.MkdirAll(mp, 0755); err != nil {
+				return fmt.Errorf("create mountpoint %q: %w", mp, err)
+			}
+			logger.Info("InitBranch: skipping dataset creation for reconstruction (zds)", "dataset", dataset, "mountpoint", mp)
+			return nil
+		}
+
 		if err := createDataset(dataset); err != nil {
 			if !strings.Contains(err.Error(), "already exists") {
 				return fmt.Errorf("create dataset %q: %w", dataset, err)

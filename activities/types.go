@@ -30,6 +30,11 @@ type InitBranchInput struct {
 	// Mode selects the branch backing type: "zvol" (block device) or "zds"
 	// (ZFS dataset / filesystem). Required.
 	Mode BranchMode `json:"mode"`
+
+	// SkipInitSnapshot, when true, skips creating the @__init snapshot and
+	// the rollback to it. Used during reconstruction where the first S3 blob
+	// is a full ZFS stream that will supply its own snapshots.
+	SkipInitSnapshot bool `json:"skip_init_snapshot,omitempty"`
 }
 
 // ExecInput is the input payload for the Exec activity.
@@ -63,6 +68,22 @@ type ExecInput struct {
 	// of cold-booting. Useful for benchmarking snapshot vs cold-boot latency.
 	// Defaults to false (cold boot).
 	UseSnapshot bool `json:"use_snapshot,omitempty"`
+
+	// Reconstruct, if non-nil, provides the snapshot chain that the worker
+	// should download from S3 to rebuild the branch locally. This is used
+	// when the worker does not have the branch or base snapshot. The worker
+	// will only attempt reconstruction if the rollback to BaseSnapshot fails.
+	Reconstruct *ReconstructInput `json:"reconstruct,omitempty"`
+}
+
+// ReconstructInput holds the snapshot chain needed to rebuild a branch from
+// S3 diffs when the worker no longer has the branch locally.
+type ReconstructInput struct {
+	// Snapshots is the ordered list of snapshot names that make up the branch
+	// history. Each snapshot (except the first) has a corresponding
+	// incremental diff in S3 at "<branchID>/<snapshot>".
+	// The first entry was created from __init so has no S3 diff.
+	Snapshots []string `json:"snapshots"`
 }
 
 // ExecOutput is the result returned by the Exec activity.

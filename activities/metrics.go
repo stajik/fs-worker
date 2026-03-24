@@ -9,17 +9,20 @@ import (
 )
 
 const (
-	metricInitBranchDuration = "fs_init_branch_duration"
-	metricExecDuration       = "fs_exec_duration"
-	metricVMKernelBoot       = "fs_vm_kernel_boot_duration"
-	metricVMGuestInit        = "fs_vm_guest_init_duration"
-	metricCmdDuration        = "fs_cmd_duration"
-	metricVMSyncDuration     = "fs_vm_sync_duration"
-	metricVMTotalDuration    = "fs_vm_total_duration"
-	metricVMShutdownDuration = "fs_vm_shutdown_duration"
-	metricSnapshotDuration   = "fs_snapshot_duration"
-	metricS3UploadDuration   = "fs_s3_upload_duration"
-	metricS3UploadBytes      = "fs_s3_upload_bytes"
+	metricInitBranchDuration     = "fs_init_branch_duration"
+	metricExecDuration           = "fs_exec_duration"
+	metricVMKernelBoot           = "fs_vm_kernel_boot_duration"
+	metricVMGuestInit            = "fs_vm_guest_init_duration"
+	metricCmdDuration            = "fs_cmd_duration"
+	metricVMSyncDuration         = "fs_vm_sync_duration"
+	metricVMTotalDuration        = "fs_vm_total_duration"
+	metricVMShutdownDuration     = "fs_vm_shutdown_duration"
+	metricSnapshotDuration       = "fs_snapshot_duration"
+	metricS3UploadDuration       = "fs_s3_upload_duration"
+	metricS3UploadBytes          = "fs_s3_upload_bytes"
+	metricS3DownloadDuration     = "fs_s3_download_duration"
+	metricS3DownloadBytes        = "fs_s3_download_bytes"
+	metricReconstructionDuration = "fs_reconstruction_duration"
 )
 
 var (
