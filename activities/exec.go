@@ -172,6 +172,29 @@ func (a *FsWorkerActivities) Exec(ctx context.Context, input ExecInput) (ExecOut
 	}
 	metricsHandler.Timer(metricSnapshotDuration).Record(time.Since(snapStart))
 
+	// Upload incremental diff to S3 (skip when base is __init — there is no
+	// meaningful prior snapshot to diff against).
+	if input.BaseSnapshot != initSnapshotName {
+		uploadStart := time.Now()
+		uploadBytes, err := a.uploadSnapshotDiff(ctx, dataset, input.ID, input.BaseSnapshot, input.TargetSnapshot)
+		if err != nil {
+			logger.Error("Exec: failed to upload snapshot diff to S3",
+				"id", input.ID,
+				"base_snapshot", input.BaseSnapshot,
+				"target_snapshot", input.TargetSnapshot,
+				"error", err,
+			)
+			return ExecOutput{}, fmt.Errorf("upload snapshot diff to S3: %w", err)
+		}
+		metricsHandler.Timer(metricS3UploadDuration).Record(time.Since(uploadStart))
+		a.s3UploadBytesHist.Observe(float64(uploadBytes))
+		logger.Info("Exec: uploaded snapshot diff to S3",
+			"id", input.ID,
+			"key", input.ID+"/"+input.TargetSnapshot,
+			"bytes", uploadBytes,
+		)
+	}
+
 	logger.Info("Exec: done",
 		"id", input.ID,
 		"exit_code", exitCode,

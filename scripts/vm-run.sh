@@ -97,6 +97,9 @@ if [[ $DETACH -eq 1 ]]; then
 
     remote_exec_sudo "
         sed -i 's|ExecStart=.*|ExecStart=${BINARY}|' /etc/systemd/system/fs-worker.service
+        sed -i '/^Environment=AWS_S3_BUCKET=/d' /etc/systemd/system/fs-worker.service
+        sed -i '/^Environment=AWS_REGION=/d' /etc/systemd/system/fs-worker.service
+        sed -i '/^\[Service\]/a Environment=AWS_S3_BUCKET=${AWS_S3_BUCKET}\nEnvironment=AWS_REGION=${AWS_REGION}' /etc/systemd/system/fs-worker.service
         systemctl daemon-reload
         systemctl restart fs-worker.service
         sleep 2
@@ -134,5 +137,7 @@ remote_exec_as_worker "pkill -x fs-worker 2>/dev/null && echo 'Stopped previous 
 
 remote_exec_as_worker "
     export ZFS_POOL='${ZFS_POOL}'
+    export AWS_S3_BUCKET='${AWS_S3_BUCKET}'
+    export AWS_REGION='${AWS_REGION}'
     exec '${BINARY}'
 "

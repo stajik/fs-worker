@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# vm-provision.sh — Provision an a1.metal EC2 instance + EBS volume on AWS
+# vm-provision.sh — Provision an a1.metal EC2 instance + EBS volume + S3 bucket on AWS
 #
 # Assumes:
 #   - AWS CLI v2 is installed and you are already authenticated
@@ -14,9 +14,11 @@
 #   3. Launches an a1.metal instance with Ubuntu 24.04 arm64
 #   4. Creates and attaches an EBS gp3 volume for the ZFS pool
 #   5. Waits for the instance to pass status checks and be SSH-reachable
-#   6. Writes / updates .env with REMOTE_HOST, REMOTE_USER, REMOTE_PEM,
-#      REMOTE_POOL_DEVICE, and AWS_INSTANCE_ID so the other scripts work
-#      immediately after this one finishes
+#   6. Creates an S3 bucket for ZFS snapshot diffs and grants the instance
+#      read/write access via an IAM instance profile
+#   7. Writes / updates .env with REMOTE_HOST, REMOTE_USER, REMOTE_PEM,
+#      REMOTE_POOL_DEVICE, AWS_S3_BUCKET, and AWS_INSTANCE_ID so the other
+#      scripts work immediately after this one finishes
 #
 # Usage:
 #   ./scripts/vm-provision.sh [--destroy]
@@ -36,6 +38,9 @@
 #   AWS_SUBNET_ID       Existing subnet to use (optional — created if absent)
 #   AWS_SG_ID           Existing security group (optional — created if absent)
 #   AWS_EIP_ID          Existing Elastic IP allocation ID   (optional — allocated if absent)
+#   AWS_S3_BUCKET       Name of the S3 bucket for diffs     (default: fs-worker-diffs-<account-id>-<region>)
+#   AWS_IAM_ROLE_NAME   IAM role name for S3 access         (default: fs-worker-s3-role)
+#   AWS_INSTANCE_PROFILE IAM instance profile name          (default: fs-worker-s3-profile)
 #   REMOTE_USER         SSH login user on the instance      (default: ubuntu)
 #   REMOTE_WORK_DIR     Project dir on the instance         (default: /home/worker/fs-worker)
 #   ZFS_POOL            ZFS pool name                       (default: testpool)
@@ -100,6 +105,9 @@ AWS_VPC_ID="${AWS_VPC_ID:-}"
 AWS_SUBNET_ID="${AWS_SUBNET_ID:-}"
 AWS_SG_ID="${AWS_SG_ID:-}"
 AWS_EIP_ID="${AWS_EIP_ID:-}"
+AWS_S3_BUCKET="${AWS_S3_BUCKET:-}"
+AWS_IAM_ROLE_NAME="${AWS_IAM_ROLE_NAME:-fs-worker-s3-role}"
+AWS_INSTANCE_PROFILE="${AWS_INSTANCE_PROFILE:-fs-worker-s3-profile}"
 AWS_INSTANCE_ID="${AWS_INSTANCE_ID:-}"
 REMOTE_USER="${REMOTE_USER:-ubuntu}"
 REMOTE_WORK_DIR="${REMOTE_WORK_DIR:-/home/worker/fs-worker}"
@@ -320,6 +328,44 @@ if [[ $DESTROY -eq 1 ]]; then
         ok "Deleted ${vol}."
     done
 
+    # ---- Empty and delete S3 bucket ----
+    DESTROY_S3_BUCKET=$(grep '^AWS_S3_BUCKET=' "${ENV_FILE}" 2>/dev/null | cut -d= -f2 || true)
+    if [[ -n "${DESTROY_S3_BUCKET}" ]]; then
+        log "Emptying and deleting S3 bucket ${DESTROY_S3_BUCKET} ..."
+        aws s3 rm "s3://${DESTROY_S3_BUCKET}" --recursive 2>/dev/null \
+            && ok "Bucket emptied." \
+            || warn "Could not empty bucket ${DESTROY_S3_BUCKET} (may already be empty or gone)."
+        aws s3api delete-bucket --bucket "${DESTROY_S3_BUCKET}" 2>/dev/null \
+            && ok "Bucket deleted." \
+            || warn "Could not delete bucket ${DESTROY_S3_BUCKET}."
+    fi
+
+    # ---- Delete IAM instance profile and role ----
+    DESTROY_PROFILE="${AWS_INSTANCE_PROFILE}"
+    DESTROY_ROLE="${AWS_IAM_ROLE_NAME}"
+    if aws iam get-instance-profile --instance-profile-name "${DESTROY_PROFILE}" &>/dev/null; then
+        log "Removing role from instance profile and deleting ..."
+        aws iam remove-role-from-instance-profile \
+            --instance-profile-name "${DESTROY_PROFILE}" \
+            --role-name "${DESTROY_ROLE}" 2>/dev/null || true
+        aws iam delete-instance-profile \
+            --instance-profile-name "${DESTROY_PROFILE}" 2>/dev/null \
+            && ok "Instance profile '${DESTROY_PROFILE}' deleted." \
+            || warn "Could not delete instance profile '${DESTROY_PROFILE}'."
+    fi
+    if aws iam get-role --role-name "${DESTROY_ROLE}" &>/dev/null; then
+        log "Deleting IAM role '${DESTROY_ROLE}' ..."
+        # Delete inline policies first
+        POLICIES=$(aws iam list-role-policies --role-name "${DESTROY_ROLE}" \
+            --query 'PolicyNames' --output text 2>/dev/null || true)
+        for pol in $POLICIES; do
+            aws iam delete-role-policy --role-name "${DESTROY_ROLE}" --policy-name "$pol" 2>/dev/null || true
+        done
+        aws iam delete-role --role-name "${DESTROY_ROLE}" 2>/dev/null \
+            && ok "IAM role '${DESTROY_ROLE}' deleted." \
+            || warn "Could not delete IAM role '${DESTROY_ROLE}'."
+    fi
+
     # ---- Delete security group ----
     if [[ -n "${AWS_SG_ID}" ]]; then
         log "Deleting security group ${AWS_SG_ID} ..."
@@ -363,7 +409,7 @@ if [[ $DESTROY -eq 1 ]]; then
     # ---- Clean .env ----
     log "Removing AWS/remote entries from ${ENV_FILE} ..."
     for key in AWS_INSTANCE_ID AWS_EIP_ID AWS_VPC_ID AWS_SUBNET_ID AWS_SG_ID \
-                AWS_KEY_NAME AWS_PEM_PATH REMOTE_HOST REMOTE_POOL_DEVICE; do
+                AWS_KEY_NAME AWS_PEM_PATH AWS_S3_BUCKET REMOTE_HOST REMOTE_POOL_DEVICE; do
         sed -i '' "/^${key}=/d" "${ENV_FILE}" 2>/dev/null || true
     done
 
@@ -389,7 +435,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # Step 1: VPC
 # ---------------------------------------------------------------------------
-log "Step 1/8 — VPC ..."
+log "Step 1/9 — VPC ..."
 
 if [[ -z "${AWS_VPC_ID}" ]]; then
     # Try to find an existing tagged VPC first
@@ -425,7 +471,7 @@ fi
 # ---------------------------------------------------------------------------
 # Step 2: Internet Gateway
 # ---------------------------------------------------------------------------
-log "Step 2/8 — Internet Gateway ..."
+log "Step 2/9 — Internet Gateway ..."
 
 IGW_ID=$(aws ec2 describe-internet-gateways \
     --filters "Name=attachment.vpc-id,Values=${AWS_VPC_ID}" \
@@ -455,7 +501,7 @@ fi
 # ---------------------------------------------------------------------------
 # Step 3: Subnet
 # ---------------------------------------------------------------------------
-log "Step 3/8 — Subnet ..."
+log "Step 3/9 — Subnet ..."
 
 if [[ -z "${AWS_SUBNET_ID}" ]]; then
     AWS_SUBNET_ID=$(aws ec2 describe-subnets \
@@ -503,7 +549,7 @@ fi
 # ---------------------------------------------------------------------------
 # Step 4: Route Table (public — 0.0.0.0/0 → IGW)
 # ---------------------------------------------------------------------------
-log "Step 4/8 — Route table ..."
+log "Step 4/9 — Route table ..."
 
 RT_ID=$(aws ec2 describe-route-tables \
     --filters "Name=vpc-id,Values=${AWS_VPC_ID}" \
@@ -540,7 +586,7 @@ fi
 # ---------------------------------------------------------------------------
 # Step 5: Security Group (SSH from your current public IP only)
 # ---------------------------------------------------------------------------
-log "Step 5/8 — Security group ..."
+log "Step 5/9 — Security group ..."
 
 MY_IP=$(curl -sf https://checkip.amazonaws.com || curl -sf https://api.ipify.org || true)
 [[ -z "${MY_IP}" ]] && die "Could not determine your public IP address. Check your internet connection."
@@ -596,7 +642,7 @@ fi
 # ---------------------------------------------------------------------------
 # Step 6: Resolve the Ubuntu 24.04 arm64 AMI (latest official Canonical AMI)
 # ---------------------------------------------------------------------------
-log "Step 6/8 — Resolving Ubuntu 24.04 LTS arm64 AMI ..."
+log "Step 6/9 — Resolving Ubuntu 24.04 LTS arm64 AMI ..."
 
 AMI_ID=$(aws ec2 describe-images \
     --owners 099720109477 \
@@ -617,7 +663,7 @@ ok "  AMI: ${AMI_ID}"
 # ---------------------------------------------------------------------------
 # Step 7: Launch the EC2 instance (idempotent — reuse if already running)
 # ---------------------------------------------------------------------------
-log "Step 7/8 — EC2 instance ..."
+log "Step 7/9 — EC2 instance ..."
 
 if [[ -n "${AWS_INSTANCE_ID}" ]]; then
     INST_STATE=$(aws ec2 describe-instances \
@@ -771,7 +817,7 @@ ok "SSH config written — you can already ssh in with: ssh -i ${AWS_PEM_PATH} $
 # ---------------------------------------------------------------------------
 # Step 8: EBS data volume for ZFS
 # ---------------------------------------------------------------------------
-log "Step 8/8 — EBS ZFS data volume ..."
+log "Step 8/9 — EBS ZFS data volume ..."
 
 # The instance's AZ
 INSTANCE_AZ=$(aws ec2 describe-instances \
@@ -932,6 +978,134 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Step 9: S3 bucket + IAM instance profile for ZFS diff save/restore
+# ---------------------------------------------------------------------------
+log "Step 9/9 — S3 bucket and IAM instance profile ..."
+
+# Derive a default bucket name from the AWS account ID + region to ensure
+# global uniqueness while remaining deterministic across re-runs.
+if [[ -z "${AWS_S3_BUCKET}" ]]; then
+    AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+    AWS_S3_BUCKET="fs-worker-diffs-${AWS_ACCOUNT_ID}-${AWS_REGION}"
+fi
+
+# Create the bucket if it doesn't already exist
+if aws s3api head-bucket --bucket "${AWS_S3_BUCKET}" 2>/dev/null; then
+    ok "  Reusing existing S3 bucket: ${AWS_S3_BUCKET}"
+else
+    log "  Creating S3 bucket: ${AWS_S3_BUCKET} ..."
+    if [[ "${AWS_REGION}" == "us-east-1" ]]; then
+        aws s3api create-bucket \
+            --bucket "${AWS_S3_BUCKET}" \
+            &>/dev/null
+    else
+        aws s3api create-bucket \
+            --bucket "${AWS_S3_BUCKET}" \
+            --create-bucket-configuration "LocationConstraint=${AWS_REGION}" \
+            &>/dev/null
+    fi
+
+    # Block all public access
+    aws s3api put-public-access-block \
+        --bucket "${AWS_S3_BUCKET}" \
+        --public-access-block-configuration \
+            "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+
+    aws s3api put-bucket-tagging \
+        --bucket "${AWS_S3_BUCKET}" \
+        --tagging "TagSet=[{Key=Name,Value=${NAME_TAG}},{Key=${TAG_KEY},Value=${TAG_VALUE}}]"
+
+    ok "  Created S3 bucket: ${AWS_S3_BUCKET}"
+fi
+
+env_set "AWS_S3_BUCKET" "${AWS_S3_BUCKET}"
+
+# ---------------------------------------------------------------------------
+# IAM role + instance profile so the EC2 instance can read/write the bucket
+# ---------------------------------------------------------------------------
+log "  Setting up IAM role and instance profile for S3 access ..."
+
+# Create the IAM role if it doesn't exist
+if aws iam get-role --role-name "${AWS_IAM_ROLE_NAME}" &>/dev/null; then
+    ok "  Reusing existing IAM role: ${AWS_IAM_ROLE_NAME}"
+else
+    log "  Creating IAM role: ${AWS_IAM_ROLE_NAME} ..."
+    aws iam create-role \
+        --role-name "${AWS_IAM_ROLE_NAME}" \
+        --assume-role-policy-document '{
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "ec2.amazonaws.com"},
+                "Action": "sts:AssumeRole"
+            }]
+        }' \
+        --tags "Key=Name,Value=${NAME_TAG}" "Key=${TAG_KEY},Value=${TAG_VALUE}" \
+        &>/dev/null
+    ok "  Created IAM role: ${AWS_IAM_ROLE_NAME}"
+fi
+
+# Attach an inline policy granting read/write to the specific bucket
+log "  Attaching S3 read/write policy for bucket ${AWS_S3_BUCKET} ..."
+aws iam put-role-policy \
+    --role-name "${AWS_IAM_ROLE_NAME}" \
+    --policy-name "fs-worker-s3-access" \
+    --policy-document "{
+        \"Version\": \"2012-10-17\",
+        \"Statement\": [{
+            \"Effect\": \"Allow\",
+            \"Action\": [
+                \"s3:GetObject\",
+                \"s3:PutObject\",
+                \"s3:DeleteObject\",
+                \"s3:ListBucket\"
+            ],
+            \"Resource\": [
+                \"arn:aws:s3:::${AWS_S3_BUCKET}\",
+                \"arn:aws:s3:::${AWS_S3_BUCKET}/*\"
+            ]
+        }]
+    }"
+ok "  S3 policy attached."
+
+# Create the instance profile if it doesn't exist
+if aws iam get-instance-profile --instance-profile-name "${AWS_INSTANCE_PROFILE}" &>/dev/null; then
+    ok "  Reusing existing instance profile: ${AWS_INSTANCE_PROFILE}"
+else
+    log "  Creating instance profile: ${AWS_INSTANCE_PROFILE} ..."
+    aws iam create-instance-profile \
+        --instance-profile-name "${AWS_INSTANCE_PROFILE}" \
+        --tags "Key=Name,Value=${NAME_TAG}" "Key=${TAG_KEY},Value=${TAG_VALUE}" \
+        &>/dev/null
+
+    aws iam add-role-to-instance-profile \
+        --instance-profile-name "${AWS_INSTANCE_PROFILE}" \
+        --role-name "${AWS_IAM_ROLE_NAME}"
+
+    # IAM instance profiles take a few seconds to propagate
+    log "  Waiting for instance profile to propagate (15s) ..."
+    sleep 15
+    ok "  Created instance profile: ${AWS_INSTANCE_PROFILE}"
+fi
+
+# Associate the instance profile with the EC2 instance (idempotent)
+CURRENT_PROFILE=$(aws ec2 describe-iam-instance-profile-associations \
+    --filters "Name=instance-id,Values=${AWS_INSTANCE_ID}" \
+              "Name=state,Values=associated" \
+    --query 'IamInstanceProfileAssociations[0].IamInstanceProfile.Arn' \
+    --output text 2>/dev/null || true)
+
+if [[ -n "${CURRENT_PROFILE}" && "${CURRENT_PROFILE}" != "None" ]]; then
+    ok "  Instance already has an IAM instance profile associated."
+else
+    log "  Associating instance profile with instance ${AWS_INSTANCE_ID} ..."
+    aws ec2 associate-iam-instance-profile \
+        --instance-id "${AWS_INSTANCE_ID}" \
+        --iam-instance-profile "Name=${AWS_INSTANCE_PROFILE}" &>/dev/null
+    ok "  Instance profile associated with instance."
+fi
+
+# ---------------------------------------------------------------------------
 # Write / update .env
 # ---------------------------------------------------------------------------
 log "Updating ${ENV_FILE} with ZFS device and instance ID ..."
@@ -952,6 +1126,8 @@ ok "  Instance ID : ${AWS_INSTANCE_ID}"
 ok "  Public IP   : ${INSTANCE_PUBLIC_IP}"
 ok "  Region      : ${AWS_REGION}"
 ok "  ZFS device  : ${POOL_DEVICE}"
+ok "  S3 bucket   : ${AWS_S3_BUCKET}"
+ok "  IAM profile : ${AWS_INSTANCE_PROFILE}"
 ok "  SSH key     : ${AWS_PEM_PATH}"
 ok ""
 ok "  .env has been updated — you can now run:"

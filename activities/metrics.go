@@ -18,6 +18,8 @@ const (
 	metricVMTotalDuration    = "fs_vm_total_duration"
 	metricVMShutdownDuration = "fs_vm_shutdown_duration"
 	metricSnapshotDuration   = "fs_snapshot_duration"
+	metricS3UploadDuration   = "fs_s3_upload_duration"
+	metricS3UploadBytes      = "fs_s3_upload_bytes"
 )
 
 var (

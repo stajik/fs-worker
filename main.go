@@ -30,6 +30,8 @@ func main() {
 	taskQueue := envOrDefault("TEMPORAL_TASK_QUEUE", "fs-worker")
 	zfsPool := envOrDefault("ZFS_POOL", "testpool")
 	metricsAddr := envOrDefault("METRICS_ADDR", ":9090")
+	s3Bucket := envOrDefault("AWS_S3_BUCKET", "")
+	s3Region := envOrDefault("AWS_REGION", "us-east-1")
 
 	log.Printf("Starting fs-worker Temporal activity worker")
 	log.Printf("  TEMPORAL_HOST      = %s", temporalHost)
@@ -37,6 +39,8 @@ func main() {
 	log.Printf("  TEMPORAL_TASK_QUEUE= %s", taskQueue)
 	log.Printf("  ZFS_POOL           = %s", zfsPool)
 	log.Printf("  METRICS_ADDR       = %s", metricsAddr)
+	log.Printf("  AWS_S3_BUCKET      = %s", s3Bucket)
+	log.Printf("  AWS_REGION         = %s", s3Region)
 
 	// Set up Prometheus metrics reporter.
 	// Buckets in seconds: 1ms, 2ms, 4ms, … up to ~3.6h (21 buckets).
@@ -85,7 +89,7 @@ func main() {
 		MaxConcurrentActivityTaskPollers: 50,
 	})
 
-	acts := activities.NewFsWorkerActivities(zfsPool)
+	acts := activities.NewFsWorkerActivities(zfsPool, s3Bucket, s3Region)
 	w.RegisterActivity(acts)
 
 	log.Printf("Worker registered on task queue %q — waiting for activity tasks", taskQueue)

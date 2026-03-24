@@ -116,6 +116,7 @@ REMOTE_POOL_DEVICE="${REMOTE_POOL_DEVICE:-}"   # e.g. /dev/nvme1n1 — EBS volum
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_PROFILE="${AWS_PROFILE:-}"
 AWS_SG_ID="${AWS_SG_ID:-}"
+AWS_S3_BUCKET="${AWS_S3_BUCKET:-}"
 
 ZFS_POOL="${ZFS_POOL:-testpool}"
 WORKER_USER="${WORKER_USER:-worker}"

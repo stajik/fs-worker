@@ -644,6 +644,8 @@ Type=simple
 User=${WORKER_USER}
 WorkingDirectory=${WORK_DIR}
 Environment=ZFS_POOL=${POOL_NAME}
+Environment=AWS_S3_BUCKET=${AWS_S3_BUCKET}
+Environment=AWS_REGION=${AWS_REGION}
 ExecStart=${WORK_DIR}/fs-worker
 Restart=on-failure
 RestartSec=5

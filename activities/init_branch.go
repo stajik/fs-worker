@@ -9,18 +9,52 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.temporal.io/sdk/activity"
 )
 
 // FsWorkerActivities holds shared state for the activity worker.
 type FsWorkerActivities struct {
-	pool string
+	pool              string
+	s3Bucket          string
+	s3Region          string
+	s3Client          *s3.Client
+	s3UploadBytesHist prometheus.Observer
 }
+
+// s3UploadBytesHistogram is a Prometheus histogram registered once at
+// package init time. Using promauto + prometheus directly (instead of tally)
+// avoids the issue where tally's DefaultHistogramBuckets override the
+// per-histogram buckets passed to scope.Histogram().
+var s3UploadBytesHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name: "temporal_" + metricS3UploadBytes,
+	Help: "Size of ZFS snapshot diffs uploaded to S3 in bytes.",
+	Buckets: []float64{
+		1024,               // 1 KB
+		4 * 1024,           // 4 KB
+		16 * 1024,          // 16 KB
+		64 * 1024,          // 64 KB
+		256 * 1024,         // 256 KB
+		1024 * 1024,        // 1 MB
+		4 * 1024 * 1024,    // 4 MB
+		16 * 1024 * 1024,   // 16 MB
+		64 * 1024 * 1024,   // 64 MB
+		256 * 1024 * 1024,  // 256 MB
+		1024 * 1024 * 1024, // 1 GB
+	},
+})
 
 // NewFsWorkerActivities returns a ready-to-use FsWorkerActivities for the
 // given ZFS pool.
-func NewFsWorkerActivities(pool string) *FsWorkerActivities {
-	return &FsWorkerActivities{pool: pool}
+func NewFsWorkerActivities(pool, s3Bucket, s3Region string) *FsWorkerActivities {
+	return &FsWorkerActivities{
+		pool:              pool,
+		s3Bucket:          s3Bucket,
+		s3Region:          s3Region,
+		s3UploadBytesHist: s3UploadBytesHistogram,
+	}
 }
 
 // InitBranch creates a new branch as either a ZFS zvol (block device) or a
